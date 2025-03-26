@@ -159,9 +159,10 @@ class BucketBatchSampler(Sampler):
     batch_size 단위로 인덱스를 묶어 배치를 구성합니다.
     배치 자체의 순서는 옵션에 따라 섞을 수 있습니다.
     """
-    def __init__(self, dataset, batch_size, shuffle_batches=True, sort_order='descending'):
+    def __init__(self, dataset, batch_size, batch_th=0, shuffle_batches=True, sort_order='descending'):
         self.dataset = dataset
         self.batch_size = batch_size
+        self.batch_th = batch_th
         self.shuffle_batches = shuffle_batches
         
         # 전체 인덱스를 구한 뒤, 각 샘플의 (num_sessions, max_interactions)로 정렬
@@ -173,8 +174,41 @@ class BucketBatchSampler(Sampler):
             return (num_sessions, max_interactions)
         indices = sorted(indices, key=sort_key, reverse=(sort_order=='descending'))
         
-        # 인덱스를 batch_size 단위로 그룹화
-        self.batches = [indices[i:i+batch_size] for i in range(0, len(indices), batch_size)]
+        if self.batch_th is None or self.batch_th == 0:
+            # 고정 batch_size로 그룹화
+            self.batches = [indices[i:i+batch_size] for i in range(0, len(indices), batch_size)]
+        else:
+            # 동적 배치 구성: 현재 배치에 샘플을 추가했을 때 cost = (현재 배치 길이) * (배치 내 최대 session 수) * (배치 내 최대 interaction 수)가 batch_th 이하가 되어야 함
+            self.batches = []
+            current_batch = []
+            current_max_sessions = 0
+            current_max_interactions = 0
+
+            for idx in indices:
+                sample = dataset[idx]
+                num_sessions = len(sample['sessions'])
+                max_interactions = max([len(sess) for sess in sample['sessions']]) if sample['sessions'] else 0
+
+                # 만약 이 샘플을 추가한다면 업데이트될 최대값들
+                candidate_max_sessions = max(current_max_sessions, num_sessions)
+                candidate_max_interactions = max(current_max_interactions, max_interactions)
+                candidate_batch_size = len(current_batch) + 1
+                candidate_cost = candidate_batch_size * candidate_max_sessions * candidate_max_interactions
+
+                # 현재 배치에 최소 한 개 샘플이 있는 경우에 한해 cost 초과 시 배치를 마감
+                if candidate_cost > self.batch_th and current_batch:
+                    self.batches.append(current_batch)
+                    current_batch = [idx]
+                    current_max_sessions = num_sessions
+                    current_max_interactions = max_interactions
+                else:
+                    current_batch.append(idx)
+                    current_max_sessions = candidate_max_sessions
+                    current_max_interactions = candidate_max_interactions
+
+            if current_batch:
+                self.batches.append(current_batch)
+        
         if self.shuffle_batches:
             random.shuffle(self.batches)
 
@@ -202,9 +236,9 @@ def get_dataloaders(args):
     )
 
     if getattr(args, 'use_bucket_batching', True):
-        train_sampler = BucketBatchSampler(train_set, batch_size=args.train_batch_size, shuffle_batches=True)
-        val_sampler = BucketBatchSampler(val_set, batch_size=args.val_batch_size, shuffle_batches=False)
-        test_sampler = BucketBatchSampler(test_set, batch_size=args.test_batch_size, shuffle_batches=False)
+        train_sampler = BucketBatchSampler(train_set, batch_th=args.train_batch_th, batch_size=args.train_batch_size, shuffle_batches=True)
+        val_sampler = BucketBatchSampler(val_set, batch_th=args.val_batch_th, batch_size=args.val_batch_size, shuffle_batches=False)
+        test_sampler = BucketBatchSampler(test_set, batch_th=args.test_batch_th, batch_size=args.test_batch_size, shuffle_batches=False)
         
         train_loader = DataLoader(train_set, batch_sampler=train_sampler, collate_fn=lambda x: seq_collate_fn(x, use_llm=args.use_llm))
         val_loader = DataLoader(val_set, batch_sampler=val_sampler, collate_fn=lambda x: seq_collate_fn(x, use_llm=args.use_llm))
