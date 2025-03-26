@@ -1,0 +1,8 @@
+# Ignore heavy dataset files in the Datasets directory
+Datasets/**/*.csv
+Datasets/**/*.json
+Datasets/**/*.jsonl
+Datasets/**/*.pickle
+Datasets/**/*.npz
+Datasets/**/*.tsv
+Datasets/**/*.txt
