@@ -22,14 +22,12 @@ class MultiHeadSelfAttention(nn.Module):
         self.out_linear = nn.Linear(num_heads * embedding_dim, embedding_dim)
 
     def forward(self, x, mask):
-        # x: [batch_size, max_session, max_interaction, embedding_dim]
+        # x: [batch_size, max_interaction, embedding_dim]
         batch_size, max_inter, embed_dim = x.shape
-        # 만약 max_inter > self.max_interactions이면, truncate 처리
         if self.max_interactions is not None and max_inter > self.max_interactions:
             x = x[:, :self.max_interactions, :]
-            mask = mask[:, :, :self.max_interactions]
+            mask = mask[:, :self.max_interactions]
             max_inter = self.max_interactions
-        
 
         head_outputs = []
         for head in self.attention_heads:
@@ -45,9 +43,14 @@ class MultiHeadSelfAttention(nn.Module):
             padding_mask = mask.unsqueeze(1)
             scores = scores.masked_fill(padding_mask == 0, float('-inf'))
 
-            attn_weights = torch.softmax(scores, dim=-1)
-            attn_weights = self.dropout(attn_weights)
+            # 만약 해당 row의 모든 값이 -inf라면, softmax 계산 전에 임시로 0으로 변경
+            all_inf = torch.isinf(scores).all(dim=-1, keepdim=True)
+            scores_safe = scores.masked_fill(all_inf, 0.0)
+            attn_weights = torch.softmax(scores_safe, dim=-1)
+            # 원래 모든 값이 -inf였던 row는 0으로 설정
+            attn_weights = torch.where(all_inf, torch.zeros_like(attn_weights), attn_weights)
 
+            attn_weights = self.dropout(attn_weights)
             head_output = torch.matmul(attn_weights, V)
             head_outputs.append(head_output)
 

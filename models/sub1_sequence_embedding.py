@@ -281,7 +281,7 @@ def get_item_embeddings(item_ids, add_info, timestamps, item_embeddings_dict,
 
     # --- 5. 요소별 결합 ---
     # 모두 [B,S,I, base_dim]
-    combined = base_embs + ts_enc + add_enc_sum
+    combined = base_embs + 0.1*ts_enc + 0.1*add_enc_sum
     # valid_mask: [B,S,I] → unsqueeze to [B,S,I,1] and multiply: invalid 위치는 0
     combined = combined * valid_mask.unsqueeze(-1).float()
 

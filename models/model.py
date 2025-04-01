@@ -166,7 +166,7 @@ class SeqRecModel(nn.Module):
         delta_ts = batch['delta_ts']
         session_mask = batch['session_mask']
         B, S, I = interaction_mask.shape
-        
+        #print(f"Batch size: {B}, Session size: {S}, Interaction size: {I}")
         st = time()
         #Sentence Embedding 구하기
         if self.use_llm:
@@ -190,7 +190,9 @@ class SeqRecModel(nn.Module):
         # Input Embedding 얻기
         combined_emb = seq_emb + time_gap_emb
         #print(f"Time gap embedding 생성 완료. 소요 시간: {time() - st:.2f}")
-
+        
+        if torch.isnan(combined_emb).any():
+            print(f"[WARNING] NaN detected in combined_emb.")
         #User embedding 구하기. prev_user_embedding은 웬만하면 None임
         if prev_user_embedding is not None:     user_emb_current = prev_user_embedding
         else:
@@ -206,11 +208,17 @@ class SeqRecModel(nn.Module):
                 mask_s = interaction_mask[:, s, :]
 
                 attention_out_s = self.attention(emb_s, mask_s)  # [B, I, D]
+                if torch.isnan(attention_out_s).any():
+                    print(f"[WARNING] NaN detected in attention_out.")
                 ffn_input_s = preprocess_inputs(attention_out_s, 
                                                 time_gap_emb[:, s, :, :], 
-                                                user_emb_current.view(B, 1, -1))
+                                                user_emb_current.view(B, 1, -1),
+                                                mask_s)
+                if torch.isnan(ffn_input_s).any():
+                    print(f"[WARNING] NaN detected in ffn_input_s.")
                 ffn_out_s = self.ffn(ffn_input_s)  # [B, I, D]
-
+                if torch.isnan(ffn_out_s).any():
+                    print(f"[WARNING] NaN detected in FFN_out.")
                 # 단일 session에 대해 target feature 선택 (select_target_features는 [B, I, D] 입력으로 작동)
                 target_feature_s = select_target_features(ffn_out_s, mask_s, self.strategy)  # [B, D]
                 session_target_features.append(target_feature_s.unsqueeze(1))  # [B, 1, D]

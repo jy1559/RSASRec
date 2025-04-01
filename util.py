@@ -90,13 +90,13 @@ def build_candidate_for_item(item_id, projection_ffn, candidate_dict, item_embed
     # 패딩된 경우: item_id가 -1이면, 동일한 크기의 0 벡터 후보 세트를 반환
     if item_id == -1:
         emb_dim = projection_ffn.fc2.out_features if hasattr(projection_ffn, "fc2") else projection_ffn.fc1.out_features
-        zero_emb = torch.zeros(emb_dim, dtype=torch.float32)
+        zero_emb = torch.zeros(emb_dim, dtype=torch.float32, device=device)
         candidate_embeddings_shuffled = [zero_emb for _ in range(candidate_size)]
         pos_index = -1
-        return candidate_embeddings_shuffled, pos_index
+        return torch.stack(candidate_embeddings_shuffled, dim=0), pos_index
 
     # Positive candidate: 자기 자신의 임베딩 (반드시 후보 세트의 첫 번째 위치로)
-    positive_emb = torch.tensor(item_embeddings[str(item_id)], dtype=torch.float32)
+    positive_emb = torch.tensor(item_embeddings[str(item_id)], dtype=torch.float32, device=device)
     
     # 미리 저장된 후보 세트에서 해당 아이템의 후보들을 조회 (candidate_dict는 int:item id -> list[int])
     if item_id in candidate_dict:
@@ -122,7 +122,7 @@ def build_candidate_for_item(item_id, projection_ffn, candidate_dict, item_embed
     
     # positive candidate는 item_id 자신이므로 index 0로 둡니다.
     pos_index = 0
-    if isinstance(candidate_embeddings_shuffled, list):
+    if isinstance(candidate_embeddings, list):
         candidate_embeddings_tensor = torch.stack(candidate_embeddings, dim=0)
     else:
         candidate_embeddings_tensor = candidate_embeddings
@@ -164,10 +164,6 @@ def build_candidate_set(batch_item_ids, candidate_size, item_embeddings, project
                 candidate_set_user.append(cand)         # cand: [candidate_size, embed_dim]
                 correct_indices_user.append(pos_idx)
             # candidate_set_user: [num_sessions, candidate_size, embed_dim]
-            # 모든 요소가 텐서인지 확인
-            for idx, elem in enumerate(candidate_set_user):
-                if not isinstance(elem, torch.Tensor):
-                    raise TypeError(f"Expected Tensor but got {type(elem)} at index {idx} in candidate_set_user")
             candidate_set_user_tensor = torch.stack(candidate_set_user, dim=0)
             candidate_sets.append(candidate_set_user_tensor)
             correct_indices.append(correct_indices_user)
@@ -256,13 +252,25 @@ def get_batch_item_ids(item_ids, strategy='EachSession_LastInter'):
     B, S, I = item_ids.shape
     
     if strategy == 'EachSession_LastInter':
-        # valid mask: 1이면 valid, 0이면 padding
-        valid_mask = (item_ids != -1)  # [B, S, I]
+        # item_ids: [B, S, I]
+        initial_valid = (item_ids != -1)  # [B, S, I]
+        # 한 세션 내에서, 한 번이라도 -1이 나오면 그 이후는 모두 False로 만듦
+        valid_mask = torch.cumprod(initial_valid.to(torch.int32), dim=-1).bool()
+        
         rev_mask = valid_mask.flip(dims=[-1])
         rev_first_valid_idx = torch.argmax(rev_mask.to(torch.int32), dim=-1)  # [B, S]
         last_valid_idx = I - 1 - rev_first_valid_idx  # [B, S]
-        last_items = torch.gather(item_ids, dim=2, index=last_valid_idx.unsqueeze(-1)).squeeze(-1)
-        return last_items  # [B, S]
+        
+        # valid item이 전혀 없는 세션의 경우
+        no_valid = (valid_mask.sum(dim=-1) == 0)
+        # torch.gather는 음수 인덱스를 허용하지 않으므로, 임시로 0으로 채워줌
+        gather_idx = last_valid_idx.clone()
+        gather_idx[no_valid] = 0
+        
+        gathered = torch.gather(item_ids, dim=2, index=gather_idx.unsqueeze(-1)).squeeze(-1)
+        # valid한 값이 없었던 세션은 -1로 설정
+        gathered[no_valid] = -1
+        return gathered  # [B, S]
     
     elif strategy == 'Global_LastInter':
         # Flatten [B, S, I] → [B, S*I]

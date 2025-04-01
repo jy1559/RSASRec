@@ -4,6 +4,8 @@ import os
 from time import time
 import argparse
 import numpy as np
+from torchviz import make_dot
+import torchviz
 from tqdm.auto import tqdm
 # dataset.py 내 get_dataloaders 함수 사용 (경로에 맞게 import 수정)
 from Datasets.dataset import get_dataloaders
@@ -24,7 +26,7 @@ def parse_args():
     parser.add_argument("--train_batch_size", type=int, default=4)
     parser.add_argument("--val_batch_size", type=int, default=4)
     parser.add_argument("--test_batch_size", type=int, default=4)
-    parser.add_argument("--train_batch_th", type=int, default=100000)
+    parser.add_argument("--train_batch_th", type=int, default=50000)
     parser.add_argument("--val_batch_th", type=int, default=100000)
     parser.add_argument("--test_batch_th", type=int, default=100000)
     parser.add_argument("--train_ratio", type=float, default=0.8)
@@ -32,10 +34,10 @@ def parse_args():
     parser.add_argument("--num_epochs", type=int, default=10)
     parser.add_argument("--use_llm", type=bool, default=False)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=1e-5)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--use_bucket_batching", type=bool, default=True)
     parser.add_argument("--optimizer", type=str, default="AdamW")
-    parser.add_argument("--candidate_size", type=int, default=10, help="Candidate set 크기 (positive + negatives)")
+    parser.add_argument("--candidate_size", type=int, default=32, help="Candidate set 크기 (positive + negatives)")
     parser.add_argument("--global_candidate", action='store_true', help="글로벌 candidate set 사용 여부")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use, e.g., 'cuda:0', 'cuda:1', etc.")
     return parser.parse_args()
@@ -43,15 +45,17 @@ def parse_args():
 def train_one_epoch(model, dataloader, optimizer, device, candidate_size, global_candidate, item_embeddings, candidate_dict):
     model.train()
     total_loss = 0.0
-
-    for batch in tqdm(dataloader, desc="epoch", leave = False, total=len(dataloader)):
+    pbar = tqdm(dataloader, desc="epoch", leave=False, total=len(dataloader))
+    for batch in pbar:
         # batch 내 tensor들은 device로 이동 (문자열은 그대로 유지)
         batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
         optimizer.zero_grad()
         
         # 모델 Forward Pass: 모델은 output_features와 업데이트된 user embedding을 반환
         output_features, updated_user_embedding = model(batch)
-        
+        #print(output_features)
+        #dot = make_dot(output_features, params=dict(model.named_parameters()))
+        #dot.render("model_graph", format="png")
         # 배치에서 정답 아이템 id 추출 (예: EachSession_LastInter 전략)
         batch_item_ids = get_batch_item_ids(batch['item_id'], strategy='EachSession_LastInter')
         # 실제 학습에서는 사전 계산된 item_embeddings를 로드하여 사용해야 합니다.
@@ -65,9 +69,8 @@ def train_one_epoch(model, dataloader, optimizer, device, candidate_size, global
         # candidate_set과 correct_indices를 device로 이동
         candidate_set = candidate_set.to(device)
         correct_indices = correct_indices.to(device)
-        
         # Loss 계산: 전략에 따라 output_features의 shape와 candidate_set shape가 달라질 수 있음.
-        loss = compute_loss(output_features, candidate_set, correct_indices,
+        loss, metric = compute_loss(output_features, candidate_set, correct_indices,
                             strategy='EachSession_LastInter',
                             global_candidate=global_candidate)
         
@@ -75,10 +78,14 @@ def train_one_epoch(model, dataloader, optimizer, device, candidate_size, global
         optimizer.step()
         
         total_loss += loss.item()
+        pbar.set_postfix(loss=loss.item(), acc=f'{metric["accuracy"]*100:.2f}%', 
+                         HR_3=f'{metric["HitRate@3"]*100:.2f}%',
+                         MRR=f'{metric["MRR"]*100:.2f}%', 
+                         NDCG3=f'{metric["NDCG@3"]*100:.2f}%')
     
     return total_loss / len(dataloader)
 
-def evaluate(model, dataloader, device, candidate_size):
+def evaluate(model, dataloader, device, item_embeddings, candidate_size):
     model.eval()
     total_loss = 0.0
     with torch.no_grad():
@@ -89,16 +96,17 @@ def evaluate(model, dataloader, device, candidate_size):
             batch_item_ids = get_batch_item_ids(batch['item_id'], strategy='EachSession_LastInter')
             candidate_set, correct_indices = get_candidate_set_for_batch(batch_item_ids.tolist(),
                                                                          candidate_size,
-                                                                         item_embeddings={},  # 실제 item_embeddings 필요
-                                                                         global_candidate=False)
+                                                                         item_embeddings=item_embeddings,  # 실제 item_embeddings 로드 필요
+                                                                         projection_ffn=model.projection_ffn,
+                                                                         global_candidate=True)
             candidate_set = candidate_set.to(device)
             correct_indices = correct_indices.to(device)
             
-            loss = compute_loss(output_features, candidate_set, correct_indices,
+            loss, metrics = compute_loss(output_features, candidate_set, correct_indices,
                                 strategy='EachSession_LastInter',
-                                global_candidate=False)
+                                global_candidate=True)
             total_loss += loss.item()
-    return total_loss / len(dataloader)
+    return total_loss / len(dataloader), metrics
 
 def main():
     args = parse_args()
@@ -110,7 +118,7 @@ def main():
     print(f"Dataset loader 생성 완료. 소요 시간: {(time() -sc):.2f}초")
     sc = time()
     
-    item_embedding_file = os.path.join(args.dataset_folder, args.dataset_name, "item_embedding.pickle")
+    item_embedding_file = os.path.join(args.dataset_folder, args.dataset_name, "item_embedding_normalized.pickle")
     item_embeddings = load_item_embeddings(item_embedding_file)
     print(f"Item embedding load 완료. 소요 시간: {(time() -sc):.2f}초")
     sc = time()
@@ -156,8 +164,8 @@ def main():
                                      global_candidate=args.global_candidate,
                                      item_embeddings =item_embeddings,
                                      candidate_dict = candidate_dict)
-        val_loss = evaluate(model, val_loader, device, candidate_size=args.candidate_size)
-        print(f"Epoch {epoch}/{args.num_epochs}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
+        val_loss, metrics = evaluate(model, val_loader, device, item_embeddings, candidate_size=args.candidate_size)
+        print(f"Epoch {epoch}/{args.num_epochs}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Vale metrics: {metrics}")
         
         # 체크포인트 저장
         checkpoint_dir = "checkpoints"

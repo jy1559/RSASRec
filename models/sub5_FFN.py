@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-def preprocess_inputs(attention_output, time_gaps, user_embedding):
+def preprocess_inputs(attention_output, time_gaps, user_embedding, valid_mask=None):
     """
     Attention 결과, Time Gap, 사용자 임베딩을 받아서 전처리합니다.
 
@@ -20,6 +20,8 @@ def preprocess_inputs(attention_output, time_gaps, user_embedding):
     # 사용자 임베딩을 Attention 결과와 Time Gap에 더하기
     combined_input = attention_output + shifted_time_gaps + user_embedding.view(user_embedding.shape[0], 1, -1)
 
+    if valid_mask is not None:
+        combined_input = combined_input * valid_mask.unsqueeze(-1)
     return combined_input
 
 class FFN(nn.Module):
