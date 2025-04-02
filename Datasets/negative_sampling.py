@@ -21,7 +21,7 @@ except ValueError:
 # -------------------
 # 후보 후보 설정
 candidate_size = 128   # 최종 후보 수 128개로 변경
-ratio_hard = 0.4
+ratio_hard = 0.2
 ratio_easy = 0.2
 n_hard = int(candidate_size * ratio_hard)
 n_easy = int(candidate_size * ratio_easy)

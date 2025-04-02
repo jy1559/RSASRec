@@ -18,7 +18,7 @@ def compute_and_save_item_embeddings(metadata_path, output_path, hf_model_path='
     - output_path: str, 결과 embedding을 저장할 pickle 파일 경로.
     - hf_model_path: str, HuggingFace 문장 임베딩 모델 경로.
     - batch_size: int, 배치 처리 크기.
-    - device: str, 모델 실행 디바이스 ('cpu' 또는 'cuda').
+    - device: str, 모델 실행 디바이스 ('cpu' 또는 'cuda')
     
     Returns:
     - embeddings: dict, {item_id: embedding (numpy array)} 형태.
@@ -35,7 +35,6 @@ def compute_and_save_item_embeddings(metadata_path, output_path, hf_model_path='
     item_ids = list(item_metadata.keys())
     # 각 아이템의 텍스트 정보를 문자열로 변환 (필요시 전처리 가능)
     sentences = [str(item_metadata[item_id]) for item_id in item_ids]
-    print(len(sentences))
     embeddings = {}
     for i in tqdm(range(0, len(sentences), batch_size), total=len(sentences) // batch_size):
         batch_sentences = sentences[i:i+batch_size]
@@ -46,7 +45,6 @@ def compute_and_save_item_embeddings(metadata_path, output_path, hf_model_path='
         batch_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
         batch_embeddings = F.normalize(batch_embeddings, p=2, dim=1)
         batch_embeddings = batch_embeddings.cpu().numpy()
-        if i == 0: print(batch_embeddings.shape)
         for j, item_id in enumerate(item_ids[i:i+batch_size]):
             embeddings[item_id] = batch_embeddings[j]
     
@@ -185,7 +183,7 @@ def build_candidate_set(batch_item_ids, candidate_size, item_embeddings, project
     
     return candidate_set_tensor, correct_indices_tensor
 
-def get_candidate_set_for_batch(batch_item_ids, candidate_size, item_embeddings, projection_ffn, candidate_dict, global_candidate=False):
+def get_candidate_set_for_batch(batch_item_ids, candidate_size, item_embeddings, projection_ffn, candidate_dict=None, global_candidate=False):
     """
     주어진 배치의 positive item id들을 기반으로 candidate set과 정답 인덱스를 생성합니다.
     
@@ -203,32 +201,45 @@ def get_candidate_set_for_batch(batch_item_ids, candidate_size, item_embeddings,
       - correct_indices_tensor: 각 샘플에 대해 정답(positive)의 인덱스를 나타내는 텐서.
     """
     if not global_candidate:
-        return build_candidate_set(batch_item_ids, candidate_size, item_embeddings, projection_ffn, candidate_dict)
+        return build_candidate_set(batch_item_ids.tolist(), candidate_size, item_embeddings, projection_ffn, candidate_dict)
     else:
-        # global candidate: candidate set은 전역적으로 하나 생성하고 모든 샘플에 동일하게 사용.
         all_item_ids = list(item_embeddings.keys())
         if len(all_item_ids) < candidate_size:
             candidate_ids = all_item_ids.copy()
         else:
             candidate_ids = random.sample(all_item_ids, candidate_size)
         
-        # 배치의 각 positive id가 candidate_ids에 포함되어 있는지 확인.
-        # 만약 포함되어 있지 않다면, 강제로 candidate_ids[0]을 해당 positive id로 교체.
-        correct_indices = []
-        for pos_id in batch_item_ids:
-            pos_id_str = str(pos_id)
-            if pos_id_str in candidate_ids:
-                correct_indices.append(candidate_ids.index(pos_id_str))
-            else:
-                candidate_ids[0] = pos_id_str
-                correct_indices.append(0)
+        # candidate_ids에 대해 매핑 딕셔너리 구축: { candidate_id(str): index }
+        mapping = {cid: idx for idx, cid in enumerate(candidate_ids)}
         
-        # candidate_ids에 해당하는 embedding을 한 번 계산.
-        candidate_set = [item_embeddings[iid] for iid in candidate_ids]
-        candidate_set = np.array(candidate_set, dtype=np.float32)  # [candidate_size, embed_dim]
-        # 배치 크기만큼 복제하여 [batch_size, candidate_size, embed_dim] 형태로 만듦.
-        candidate_set_tensor = torch.tensor(np.repeat(candidate_set[np.newaxis, ...], len(batch_item_ids), axis=0))
-        correct_indices_tensor = torch.tensor(correct_indices, dtype=torch.long)
+        # batch_item_ids는 텐서로 들어온다고 가정하고, flatten 처리
+        flat_ids = batch_item_ids.view(-1)
+        correct_indices = []
+        for pos_id in flat_ids.tolist():
+            if pos_id == -1:
+                correct_indices.append(-1)
+            else:
+                pos_id_str = str(pos_id)
+                if pos_id_str in mapping:
+                    correct_indices.append(mapping[pos_id_str])
+                else:
+                    # candidate_ids에 없는 경우, 추가하고 그 인덱스를 반환
+                    mapping[pos_id_str] = len(mapping)
+                    candidate_ids.append(pos_id_str)
+                    correct_indices.append(mapping[pos_id_str])
+        
+        # candidate_ids에 해당하는 임베딩을 한 번에 계산.
+        device = next(projection_ffn.parameters()).device if projection_ffn is not None else torch.device('cpu')
+        candidate_set = [
+            projection_ffn(torch.tensor(item_embeddings[cid], dtype=torch.float32, device=device).unsqueeze(0)).squeeze(0)
+            for cid in candidate_ids
+        ]
+        # torch.stack으로 candidate_set 텐서를 만듦: [candidate_size, embed_dim]
+        candidate_set_tensor = torch.stack(candidate_set, dim=0)
+        
+        # correct_indices를 원래 배치 shape으로 복원
+        correct_indices_tensor = torch.tensor(correct_indices, dtype=torch.long).view(batch_item_ids.shape)
+        
         return candidate_set_tensor, correct_indices_tensor
 
 

@@ -2,6 +2,7 @@ from transformers import AutoTokenizer, AutoModel
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+from .sub2_time_gap import sinusoidal_encoding
 from tqdm.auto import tqdm
 
 ########################
@@ -91,13 +92,16 @@ class TimestampEncoder(nn.Module):
     Timestamp를 인코딩하는 모듈.
     간단히 1차원 스칼라를 받아 output_dim 차원 벡터로 변환.
     """
-    def __init__(self, output_dim):
+    def __init__(self, output_dim, sinusoidal_dim=512, sinusoidal_max=10000):
         super(TimestampEncoder, self).__init__()
-        self.linear = nn.Linear(1, output_dim)
-    
+        self.linear = nn.Linear(sinusoidal_dim, output_dim)
+        self.sinusoidal_dim = sinusoidal_dim
+        self.sinusoidal_max = sinusoidal_max
+
     def forward(self, x):
         # x: [batch] 또는 [1] 형태의 tensor
-        return self.linear(x.unsqueeze(-1)).squeeze(-1)  # 결과: [output_dim]
+        sin_enc = sinusoidal_encoding(x, self.sinusoidal_dim, self.sinusoidal_max)
+        return self.linear(sin_enc)  # 결과: [output_dim]
         
 
 class AddInfoEncoder(nn.Module):
@@ -166,7 +170,6 @@ def get_item_embeddings_old(item_ids, add_info, timestamps, item_embeddings_dict
     ts_flat = timestamps.view(-1, 1)  # [B*S*I, 1]
     ts_enc_flat = timestamp_encoder(ts_flat)  # [B*S*I, base_dim]
     ts_enc = ts_enc_flat.view(B, S, I, -1)
-    
     # 4. Add_info encoding:
     # add_info는 list 형태이므로, 먼저 [B, S, I, num_add_info] 텐서로 변환 (유효한 경우에만 값 사용)
     num_add_info = len(add_info_encoders)

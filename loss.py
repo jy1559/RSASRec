@@ -18,49 +18,41 @@ def pad_and_stack(list_of_tensors, pad_value=0.0):
         out[i, :L, :] = t
     return out, torch.tensor(lengths, device=device)
 
-def compute_seqrec_metrics(logits_flat, targets_flat, valid_mask=None, k=[1, 3, 5]):
+def compute_seqrec_metrics(logits_flat, targets_flat, valid_mask=None, k=[1, 3, 5, 10]):
     """
-    logits_flat: [N, candidate_size] 텐서, 각 row는 후보에 대한 점수
-    targets_flat: [N] 텐서, 각 원소는 정답 후보의 인덱스 (패딩된 경우 -1)
-    valid_mask: optional, [N] boolean 텐서. 제공하지 않으면 (targets_flat != -1)로 설정.
-    k: HitRate와 NDCG를 계산할 때 사용할 cutoff
-    
-    반환:
-      metrics: dict, {"accuracy": ..., "MRR": ..., "HitRate@k": ..., "NDCG@k": ...}
+    logits_flat: [N, candidate_size]
+    targets_flat: [N]
+    valid_mask: optional [N]
+    k: list of cutoff values
     """
     if valid_mask is None:
         valid_mask = (targets_flat != -1)
-    
-    # 유효 샘플만 필터링
-    valid_logits = logits_flat[valid_mask]
-    valid_targets = targets_flat[valid_mask]
-    
+
+    valid_logits = logits_flat[valid_mask]        # [N_valid, C]
+    valid_targets = targets_flat[valid_mask]      # [N_valid]
+
     if valid_targets.numel() == 0:
-        return {"accuracy": 0.0, "MRR": 0.0, f"HitRate": 0.0, f"NDCG": 0.0}
-    
-    # Accuracy: argmax한 값이 정답과 일치하는지
-    preds = torch.argmax(valid_logits, dim=-1)
+        return {"accuracy": 0.0, "MRR": 0.0, "HitRate@1": 0.0, "NDCG@1": 0.0}
+
+    # 정답 점수 추출
+    target_logits = valid_logits.gather(1, valid_targets.unsqueeze(1))  # [N_valid, 1]
+
+    # rank 계산: target보다 큰 logit의 수를 셈
+    rank = (valid_logits > target_logits).sum(dim=1)  # [N_valid], 0-based rank
+    mrr = (1.0 / (rank + 1).float()).mean().item()
+
+    # Accuracy (top-1 정답 여부)
+    preds = torch.argmax(valid_logits, dim=1)
     accuracy = (preds == valid_targets).float().mean().item()
-    
-    # 순위 계산: 각 샘플에 대해, 정답의 rank (0-indexed)
-    # argsort 내림차순 -> 각 row에 대해 정답이 몇 번째에 있는지 계산
-    sorted_indices = torch.argsort(valid_logits, dim=-1, descending=True)  # [N_valid, candidate_size]
-    # 각 row에 대해, 정답이 있는 위치(0-indexed)를 찾습니다.
-    eq = (sorted_indices == valid_targets.unsqueeze(1))  # [N_valid, candidate_size]
-    ranks = torch.argmax(eq.to(torch.int64), dim=1)  # [N_valid]
-    
-    # MRR: 평균 reciprocal rank
-    mrr = (1.0 / (ranks.to(torch.float32) + 1)).mean().item()
-    
+
     hitrate, ndcg_k = {}, {}
     for k_val in k:
-
-        hit_at_k = (ranks < k_val).float().mean().item()
-        dcg = torch.where(ranks < k_val, 1.0 / torch.log2(ranks.to(torch.float32) + 2), torch.zeros_like(ranks.to(torch.float32)))
+        hit_at_k = (rank < k_val).float().mean().item()
+        dcg = torch.where(rank < k_val, 1.0 / torch.log2(rank.float() + 2), torch.zeros_like(rank.float()))
         ndcg = dcg.mean().item()
         hitrate[k_val] = hit_at_k
         ndcg_k[k_val] = ndcg
-    
+
     metrics = {
         "accuracy": accuracy,
         "MRR": mrr,
@@ -68,9 +60,9 @@ def compute_seqrec_metrics(logits_flat, targets_flat, valid_mask=None, k=[1, 3, 
     for k_val in k:
         metrics[f"HitRate@{k_val}"] = hitrate[k_val]
         metrics[f"NDCG@{k_val}"] = ndcg_k[k_val]
-    
 
     return metrics
+
 
 def compute_loss(target_features, candidate_set, correct_indices, 
                  strategy='EachSession_LastInter', global_candidate=False, 
@@ -118,32 +110,39 @@ def compute_loss(target_features, candidate_set, correct_indices,
     # global candidate인 경우, candidate_set: [num_candidates, D]
     # 각 target feature에 대해 같은 candidate_set 사용
     if global_candidate:
-        # global_candidate: candidate_set shape [C, D]
-        # target_features may be [B, S, D] or [B, D]
+        C = candidate_set.shape[0]
+        chunk_size = 1024
+
         if target_features.dim() == 3:
             B, S, D = target_features.shape
-            C = candidate_set.shape[0]
-            # Expand candidate_set: [1, 1, C, D]
-            cand_exp = candidate_set.unsqueeze(0).unsqueeze(0)
-            # target_features: [B, S, 1, D]
-            target_exp = target_features.unsqueeze(2)
-            # Compute logits: [B, S, C])
-            logits = compute_logits(target_exp, cand_exp)
-            # correct_indices should be [B, S]
-            # Flatten: [B*S, C] and target: [B*S]
+            target_exp = target_features.unsqueeze(2)  # [B, S, 1, D]
+            logits_chunks = []
+
+            for i in range(0, C, chunk_size):
+                cand_chunk = candidate_set[i:i+chunk_size]  # [chunk_size, D]
+                cand_exp = cand_chunk.unsqueeze(0).unsqueeze(0)  # [1, 1, chunk_size, D]
+                logits_chunk = compute_logits(target_exp, cand_exp)  # [B, S, chunk_size]
+                logits_chunks.append(logits_chunk)
+
+            logits = torch.cat(logits_chunks, dim=-1)  # [B, S, C]
             logits_flat = logits.view(B * S, C)
             targets_flat = correct_indices.view(B * S)
+
         elif target_features.dim() == 2:
-            # target_features: [B, D]
             B, D = target_features.shape
-            C = candidate_set.shape[0]
-            # Expand candidate_set: [1, C, D]
-            cand_exp = candidate_set.unsqueeze(0)
-            # target_features: [B, 1, D]
-            target_exp = target_features.unsqueeze(1)
-            logits = compute_logits(target_exp, cand_exp)  # [B, C]
+            target_exp = target_features.unsqueeze(1)  # [B, 1, D]
+            logits_chunks = []
+
+            for i in range(0, C, chunk_size):
+                cand_chunk = candidate_set[i:i+chunk_size]  # [chunk_size, D]
+                cand_exp = cand_chunk.unsqueeze(0)  # [1, chunk_size, D]
+                logits_chunk = compute_logits(target_exp, cand_exp)  # [B, chunk_size]
+                logits_chunks.append(logits_chunk)
+
+            logits = torch.cat(logits_chunks, dim=-1)  # [B, C]
             logits_flat = logits
             targets_flat = correct_indices
+
         else:
             raise ValueError("target_features의 차원은 2 또는 3이어야 합니다.")
     else:

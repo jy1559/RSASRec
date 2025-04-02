@@ -26,9 +26,9 @@ def parse_args():
     parser.add_argument("--train_batch_size", type=int, default=4)
     parser.add_argument("--val_batch_size", type=int, default=4)
     parser.add_argument("--test_batch_size", type=int, default=4)
-    parser.add_argument("--train_batch_th", type=int, default=50000)
-    parser.add_argument("--val_batch_th", type=int, default=100000)
-    parser.add_argument("--test_batch_th", type=int, default=100000)
+    parser.add_argument("--train_batch_th", type=int, default=100000)
+    parser.add_argument("--val_batch_th", type=int, default=20000)
+    parser.add_argument("--test_batch_th", type=int, default=20000)
     parser.add_argument("--train_ratio", type=float, default=0.8)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--num_epochs", type=int, default=10)
@@ -60,7 +60,7 @@ def train_one_epoch(model, dataloader, optimizer, device, candidate_size, global
         batch_item_ids = get_batch_item_ids(batch['item_id'], strategy='EachSession_LastInter')
         # 실제 학습에서는 사전 계산된 item_embeddings를 로드하여 사용해야 합니다.
         # 여기서는 예시를 위해 빈 dict로 전달한 후 내부에서 적절한 처리를 하거나 dummy candidate set을 사용하도록 합니다.
-        candidate_set, correct_indices = get_candidate_set_for_batch(batch_item_ids.tolist(),
+        candidate_set, correct_indices = get_candidate_set_for_batch(batch_item_ids,
                                                                      candidate_size,
                                                                      item_embeddings=item_embeddings,  # 실제 item_embeddings 로드 필요
                                                                      projection_ffn=model.projection_ffn,
@@ -94,8 +94,8 @@ def evaluate(model, dataloader, device, item_embeddings, candidate_size):
             output_features, updated_user_embedding = model(batch)
             
             batch_item_ids = get_batch_item_ids(batch['item_id'], strategy='EachSession_LastInter')
-            candidate_set, correct_indices = get_candidate_set_for_batch(batch_item_ids.tolist(),
-                                                                         candidate_size,
+            candidate_set, correct_indices = get_candidate_set_for_batch(batch_item_ids,
+                                                                         candidate_size=1e10,
                                                                          item_embeddings=item_embeddings,  # 실제 item_embeddings 로드 필요
                                                                          projection_ffn=model.projection_ffn,
                                                                          global_candidate=True)

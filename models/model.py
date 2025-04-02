@@ -139,7 +139,7 @@ class SeqRecModel(nn.Module):
             from models.model import apply_lora  # assume apply_lora is defined in model.py
             apply_lora(self.sentence_model, r=self.lora_r, alpha=self.lora_alpha)
         
-        self.time_gap_embed = TimeGapEmbedding(embedding_dim=embed_dim, hidden_dim=time_gap_hidden_dim)
+        self.time_gap_embed = TimeGapEmbedding(embedding_dim=embed_dim, hidden_dim=time_gap_hidden_dim, embedding_type='hybrid', sinusoidal_dim=512)
         self.attention = MultiHeadSelfAttention(embedding_dim=embed_dim, num_heads=num_attention_heads, dropout=dropout)
         self.ffn = create_ffn_model(input_dim=embed_dim, hidden_dim=ffn_hidden_dim, output_dim=embed_dim)
         self.user_emb_updater = UserEmbeddingUpdater(embedding_dim=embed_dim)
@@ -183,10 +183,17 @@ class SeqRecModel(nn.Module):
 
 
         #Time gap embedding 얻기
+        
+        if torch.isnan(delta_ts).any():
+            print(f"[WARNING] NaN detected in delta_ts")
         time_gap_emb = self.time_gap_embed(delta_ts)
         if not self.update_time_gap:
             time_gap_emb = time_gap_emb.detach()
         
+        if torch.isnan(seq_emb).any():
+            print(f"[WARNING] NaN detected in seq_emb.")
+        if torch.isnan(time_gap_emb).any():
+            print(f"[WARNING] NaN detected in time_gap_emb.")
         # Input Embedding 얻기
         combined_emb = seq_emb + time_gap_emb
         #print(f"Time gap embedding 생성 완료. 소요 시간: {time() - st:.2f}")

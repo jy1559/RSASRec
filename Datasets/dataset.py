@@ -4,6 +4,7 @@ import json
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split, Sampler
 import random
+import math
 from datetime import datetime
 
 class SeqRecDataset(Dataset):
@@ -37,7 +38,7 @@ class SeqRecDataset(Dataset):
                     add_info = None
                 else:               
                     sentence = None
-                delta_t = None if prev_timestamp is None else (timestamp - prev_timestamp) / 1000
+                delta_t = None if prev_timestamp is None else math.log(timestamp - prev_timestamp + 1e-7)
                 prev_timestamp = timestamp
 
                 session_interactions.append({
