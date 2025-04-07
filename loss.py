@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 def pad_and_stack(list_of_tensors, pad_value=0.0):
     """
@@ -18,32 +19,36 @@ def pad_and_stack(list_of_tensors, pad_value=0.0):
         out[i, :L, :] = t
     return out, torch.tensor(lengths, device=device)
 
-def compute_seqrec_metrics(logits_flat, targets_flat, valid_mask=None, k=[1, 3, 5, 10]):
-    """
-    logits_flat: [N, candidate_size]
-    targets_flat: [N]
-    valid_mask: optional [N]
-    k: list of cutoff values
-    """
+def compute_seqrec_metrics(logits_flat, targets_flat, session_ids=None, valid_mask=None, k=[1, 3, 5, 10], chunk_size=1024):
     if valid_mask is None:
         valid_mask = (targets_flat != -1)
 
     valid_logits = logits_flat[valid_mask]        # [N_valid, C]
     valid_targets = targets_flat[valid_mask]      # [N_valid]
+    valid_session_ids = session_ids[valid_mask]       # [N_valid]
 
     if valid_targets.numel() == 0:
         return {"accuracy": 0.0, "MRR": 0.0, "HitRate@1": 0.0, "NDCG@1": 0.0}
 
-    # 정답 점수 추출
-    target_logits = valid_logits.gather(1, valid_targets.unsqueeze(1))  # [N_valid, 1]
+    N, C = valid_logits.shape
+    device = valid_logits.device
 
-    # rank 계산: target보다 큰 logit의 수를 셈
-    rank = (valid_logits > target_logits).sum(dim=1)  # [N_valid], 0-based rank
-    mrr = (1.0 / (rank + 1).float()).mean().item()
+    # 각 row마다 target logit만 뽑기
+    target_scores = valid_logits[torch.arange(N), valid_targets]  # [N]
 
-    # Accuracy (top-1 정답 여부)
+    # Accuracy
     preds = torch.argmax(valid_logits, dim=1)
     accuracy = (preds == valid_targets).float().mean().item()
+
+    # 메모리 절약 rank 계산
+    rank = torch.zeros(N, device=device, dtype=torch.long)
+    for i in range(0, C, chunk_size):
+        chunk = valid_logits[:, i:i+chunk_size]  # [N, chunk]
+        # target_scores: [N, 1] vs chunk: [N, chunk]
+        rank += (chunk > target_scores.unsqueeze(1)).sum(dim=1)
+
+    # MRR
+    mrr = (1.0 / (rank.float() + 1)).mean().item()
 
     hitrate, ndcg_k = {}, {}
     for k_val in k:
@@ -56,6 +61,43 @@ def compute_seqrec_metrics(logits_flat, targets_flat, valid_mask=None, k=[1, 3, 
     metrics = {
         "accuracy": accuracy,
         "MRR": mrr,
+    }
+    for k_val in k:
+        metrics[f"HitRate@{k_val}"] = hitrate[k_val]
+        metrics[f"NDCG@{k_val}"] = ndcg_k[k_val]
+
+    # Compute NSU per session
+    # Assumes that within each session, the order in the flattened tensors is the ideal order.
+    unique_sessions = torch.unique(valid_session_ids)
+    nsu_list = []
+    for s in unique_sessions:
+        # Indices for session s
+        sess_idx = (valid_session_ids == s).nonzero(as_tuple=True)[0]
+        if sess_idx.numel() == 0:
+            continue
+        # For session s, get predicted ranks
+        sess_ranks = rank[sess_idx]  # [m]
+        m = sess_ranks.numel()
+        # Create ideal order indices: 1,2,...,m
+        ideal_order = torch.arange(1, m+1, device=device).float()
+        # Ideal weights: 1 / log2(j+1)
+        ideal_weights = 1.0 / torch.log2(ideal_order + 1)
+        # Predicted discount: 1 / log2(r_j+2)
+        predicted_discount = 1.0 / torch.log2(sess_ranks.float() + 2)
+        # Session utility: sum_{j=1}^m w_j * predicted_discount_j
+        U_actual = torch.sum(ideal_weights * predicted_discount)
+        # Ideal utility: sum_{j=1}^m (w_j)^2
+        U_ideal = torch.sum(ideal_weights ** 2)
+        nsu_s = U_actual / U_ideal if U_ideal > 0 else 0.0
+        nsu_list.append(nsu_s.item())
+
+    NSU_metric = np.mean(nsu_list) if nsu_list else 0.0
+
+    # Combine all metrics in a dictionary
+    metrics = {
+        "accuracy": accuracy,
+        "MRR": mrr,
+        "NSU": NSU_metric,
     }
     for k_val in k:
         metrics[f"HitRate@{k_val}"] = hitrate[k_val]
@@ -127,6 +169,7 @@ def compute_loss(target_features, candidate_set, correct_indices,
             logits = torch.cat(logits_chunks, dim=-1)  # [B, S, C]
             logits_flat = logits.view(B * S, C)
             targets_flat = correct_indices.view(B * S)
+            session_ids = torch.arange(B, device=target_features.device).unsqueeze(1).expand(B, S).reshape(-1)
 
         elif target_features.dim() == 2:
             B, D = target_features.shape
@@ -142,6 +185,7 @@ def compute_loss(target_features, candidate_set, correct_indices,
             logits = torch.cat(logits_chunks, dim=-1)  # [B, C]
             logits_flat = logits
             targets_flat = correct_indices
+            session_ids = torch.arange(B, device=target_features.device)
 
         else:
             raise ValueError("target_features의 차원은 2 또는 3이어야 합니다.")
@@ -163,6 +207,8 @@ def compute_loss(target_features, candidate_set, correct_indices,
             logits = compute_logits(target_features.unsqueeze(2).expand(-1, -1, candidate_size, -1), candidate_set)
             logits_flat = logits.view(B * S, candidate_size)
             targets_flat = correct_indices.view(B * S)
+            session_ids = torch.arange(B, device=target_features.device).unsqueeze(1).expand(B, S).reshape(-1)
+
         elif target_features.dim() == 2:
             # LastSession_AllInter case: target_features: [B, D], candidate_set: [B, candidate_size, D]
             B, D = target_features.shape
@@ -170,6 +216,8 @@ def compute_loss(target_features, candidate_set, correct_indices,
             logits = compute_logits(target_features.unsqueeze(1).expand(-1, candidate_size, -1), candidate_set)
             logits_flat = logits
             targets_flat = correct_indices
+            session_ids = torch.arange(B, device=target_features.device)
+
         else:
             raise ValueError("target_features의 차원은 2 또는 3이어야 합니다.")
     
@@ -182,7 +230,7 @@ def compute_loss(target_features, candidate_set, correct_indices,
     else:
         loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
         loss = loss_fn(logits_flat, targets_flat)
-    metrics = compute_seqrec_metrics(logits_flat, targets_flat, mask)
+    metrics = compute_seqrec_metrics(logits_flat, targets_flat, session_ids, mask)
     return loss, metrics
 
 if __name__ == '__main__':

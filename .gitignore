@@ -6,3 +6,5 @@ Datasets/**/*.pickle
 Datasets/**/*.npz
 Datasets/**/*.tsv
 Datasets/**/*.txt
+checkpoints/**/*.*
+wandb/**/*.*
