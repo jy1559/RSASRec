@@ -34,17 +34,21 @@ def parse_args():
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--num_epochs", type=int, default=10)
     parser.add_argument("--use_llm", type=bool, default=False)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--use_bucket_batching", type=bool, default=True)
     parser.add_argument("--optimizer", type=str, default="AdamW")
+    parser.add_argument("--train_strategy", type=str, default="EachSession_LastInter")
+    parser.add_argument("--test_strategy", type=str, default="Global_LastInter")
     parser.add_argument("--candidate_size", type=int, default=32, help="Candidate set 크기 (positive + negatives)")
     parser.add_argument("--global_candidate", action='store_true', help="글로벌 candidate set 사용 여부")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use, e.g., 'cuda:0', 'cuda:1', etc.")
+    parser.add_argument("--wandb_off", action="store_true", help="Turn off wandb logging")
     return parser.parse_args()
 
-def train_one_epoch(model, dataloader, optimizer, device, candidate_size, global_candidate, item_embeddings, candidate_dict):
+def train_one_epoch(model, dataloader, optimizer, device, candidate_size, global_candidate, item_embeddings, candidate_dict, wandb_logging, train_strategy='EachSession_LastInter'):
     model.train()
+    model.strategy = train_strategy
     total_loss = 0.0
     batch_counter = 0
     pbar = tqdm(dataloader, desc="epoch", leave=False, total=len(dataloader))
@@ -53,37 +57,38 @@ def train_one_epoch(model, dataloader, optimizer, device, candidate_size, global
         # batch 내 tensor들은 device로 이동 (문자열은 그대로 유지)
         batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
         optimizer.zero_grad()
-        
-        # 모델 Forward Pass: 모델은 output_features와 업데이트된 user embedding을 반환
+
+        # 모델 forward
         output_features, updated_user_embedding = model(batch)
-        #print(output_features)
-        #dot = make_dot(output_features, params=dict(model.named_parameters()))
-        #dot.render("model_graph", format="png")
-        # 배치에서 정답 아이템 id 추출 (예: EachSession_LastInter 전략)
-        batch_item_ids = get_batch_item_ids(batch['item_id'], strategy='EachSession_LastInter')
-        # 실제 학습에서는 사전 계산된 item_embeddings를 로드하여 사용해야 합니다.
-        # 여기서는 예시를 위해 빈 dict로 전달한 후 내부에서 적절한 처리를 하거나 dummy candidate set을 사용하도록 합니다.
-        candidate_set, correct_indices = get_candidate_set_for_batch(batch_item_ids,
-                                                                     candidate_size,
-                                                                     item_embeddings=item_embeddings,  # 실제 item_embeddings 로드 필요
-                                                                     projection_ffn=model.projection_ffn,
-                                                                     candidate_dict=candidate_dict,
-                                                                     global_candidate=global_candidate)
-        # candidate_set과 correct_indices를 device로 이동
+        
+        # get_batch_item_ids는 [B, max_len]와 loss_mask ([B, max_len])를 반환
+        batch_item_ids, loss_mask, session_ids = get_batch_item_ids(batch['item_id'], strategy=train_strategy)
+        
+        candidate_set, correct_indices = get_candidate_set_for_batch(
+            batch_item_ids,
+            candidate_size,
+            item_embeddings=item_embeddings,
+            projection_ffn=model.projection_ffn,
+            candidate_dict=candidate_dict,
+            global_candidate=global_candidate
+        )
         candidate_set = candidate_set.to(device)
         correct_indices = correct_indices.to(device)
-        # Loss 계산: 전략에 따라 output_features의 shape와 candidate_set shape가 달라질 수 있음.
-        loss, metric = compute_loss(output_features, candidate_set, correct_indices,
-                            strategy='EachSession_LastInter',
-                            global_candidate=global_candidate)
+        
+        loss, metric = compute_loss(
+            output_features, candidate_set, correct_indices,
+            strategy=train_strategy,
+            global_candidate=global_candidate,
+            loss_mask=loss_mask,
+            session_ids=session_ids
+        )
         
         loss.backward()
         optimizer.step()
         
         total_loss += loss.item()
-        if batch_counter % 1 == 0:
+        if wandb_logging and batch_counter % 5 == 0:
             wandb.log({
-                "train/batch": batch_counter,
                 "train/loss": loss.item(),
                 "train/accuracy": metric["accuracy"],
                 "train/MRR": metric["MRR"],
@@ -95,42 +100,59 @@ def train_one_epoch(model, dataloader, optimizer, device, candidate_size, global
                 "train/NDCG@5": metric["NDCG@5"],
                 "train/HitRate@10": metric["HitRate@10"],
                 "train/NDCG@10": metric["NDCG@10"],
-                "train/NSU": metric["NSU"]
+                "train/SRA": metric["SRA"],
+                "train/WSRA": metric["WSRA"]
             })
         pbar.set_postfix(loss=loss.item(), acc=f'{metric["accuracy"]*100:.2f}%', 
                          HR_3=f'{metric["HitRate@3"]*100:.2f}%',
+                         HR_10=f'{metric["HitRate@10"]*100:.2f}%',
                          MRR=f'{metric["MRR"]*100:.2f}%', 
-                         NDCG3=f'{metric["NDCG@3"]*100:.2f}%')
-    
+                         NDCG3=f'{metric["NDCG@3"]*100:.2f}%',
+                         NDCG5=f'{metric["NDCG@5"]*100:.2f}%',
+                         SRA = f'{metric["SRA"]*100:.2f}%',
+                         WSRA = f'{metric["WSRA"]*100:.2f}%')
     return total_loss / len(dataloader)
 
-def evaluate(model, dataloader, device, item_embeddings, candidate_size):
+
+def evaluate(model, dataloader, device, item_embeddings, candidate_size, candidate_dict, loss_strategy='Global_LastInter', global_candidate = True):
     model.eval()
+    model.strategy = loss_strategy
     total_loss = 0.0
+    metrics = {}
     with torch.no_grad():
         for batch in dataloader:
             batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
             output_features, updated_user_embedding = model(batch)
             
-            batch_item_ids = get_batch_item_ids(batch['item_id'], strategy='EachSession_LastInter')
-            candidate_set, correct_indices = get_candidate_set_for_batch(batch_item_ids,
-                                                                         candidate_size=candidate_size,#1e10,
-                                                                         item_embeddings=item_embeddings,  # 실제 item_embeddings 로드 필요
-                                                                         projection_ffn=model.projection_ffn,
-                                                                         global_candidate=False)#True)
+            batch_item_ids, loss_mask, session_ids = get_batch_item_ids(batch['item_id'], strategy=loss_strategy)
+            
+            candidate_set, correct_indices = get_candidate_set_for_batch(
+                batch_item_ids,
+                candidate_size,
+                item_embeddings=item_embeddings,
+                projection_ffn=model.projection_ffn,
+                candidate_dict=candidate_dict,
+                global_candidate=global_candidate
+            )
             candidate_set = candidate_set.to(device)
             correct_indices = correct_indices.to(device)
             
-            loss, metrics = compute_loss(output_features, candidate_set, correct_indices,
-                                strategy='EachSession_LastInter',
-                                global_candidate=False)#True)
+            loss, metrics = compute_loss(
+                output_features, candidate_set, correct_indices,
+                strategy=loss_strategy,
+                global_candidate=global_candidate,
+                loss_mask=loss_mask,
+                session_ids=session_ids
+            )
             total_loss += loss.item()
     return total_loss / len(dataloader), metrics
+
 
 def main():
     args = parse_args()
     device = args.device
-    wandb.init(project="RSASRec_25April", config=vars(args))
+    if not args.wandb_off:
+        wandb.init(project="RSASRec_25April", config=vars(args))
     # 데이터셋 로더 생성
     sc = time()
     train_loader, val_loader, test_loader = get_dataloaders(args)
@@ -164,7 +186,8 @@ def main():
     
     model = SeqRecModel(num_add_info=num_add_info, item_embedding_dict = item_embeddings if not args.use_llm else None, device=device)
     model.to(device)
-    wandb.watch(model, log="all")
+    if not args.wandb_off:
+        wandb.watch(model, log="all")
     print(f"Model 초기화 완료. 소요 시간: {(time() -sc):.2f}초")
     sc = time()
     
@@ -183,25 +206,36 @@ def main():
                                      candidate_size=args.candidate_size,
                                      global_candidate=args.global_candidate,
                                      item_embeddings =item_embeddings,
-                                     candidate_dict = candidate_dict)
-        val_loss, metrics = evaluate(model, val_loader, device, item_embeddings, candidate_size=args.candidate_size, candidate_dict = candidate_dict)
+                                     train_strategy = args.train_strategy,
+                                     candidate_dict = candidate_dict,
+                                     wandb_logging =not args.wandb_off)
+        val_loss, metrics = evaluate(model, 
+                                     val_loader, 
+                                     device, 
+                                     item_embeddings, 
+                                     candidate_size=args.candidate_size, 
+                                     candidate_dict = candidate_dict, 
+                                     global_candidate = args.global_candidate,
+                                     loss_strategy = args.test_strategy)
         print(f"Epoch {epoch}/{args.num_epochs}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Val metrics: {metrics}")
-        wandb.log({
-            "train/epoch": epoch + 1,
-            "val/epoch": epoch + 1,
-            "val/loss": val_loss,
-            "val/accuracy": metrics["accuracy"],
-            "val/MRR": metrics["MRR"],
-            "val/HitRate@1": metrics["HitRate@1"],
-            "val/NDCG@1": metrics["NDCG@1"],
-            "val/HitRate@3": metrics["HitRate@3"],
-            "val/NDCG@3": metrics["NDCG@3"],
-            "val/HitRate@5": metrics["HitRate@5"],
-            "val/NDCG@5": metrics["NDCG@5"],
-            "val/HitRate@10": metrics["HitRate@10"],
-            "val/NDCG@10": metrics["NDCG@10"],
-            "val/NSU": metrics["NSU"]
-        })
+        if not args.wandb_off:
+            wandb.log({
+                "train/epoch": epoch + 1,
+                "val/epoch": epoch + 1,
+                "val/loss": val_loss,
+                "val/accuracy": metrics["accuracy"],
+                "val/MRR": metrics["MRR"],
+                "val/HitRate@1": metrics["HitRate@1"],
+                "val/NDCG@1": metrics["NDCG@1"],
+                "val/HitRate@3": metrics["HitRate@3"],
+                "val/NDCG@3": metrics["NDCG@3"],
+                "val/HitRate@5": metrics["HitRate@5"],
+                "val/NDCG@5": metrics["NDCG@5"],
+                "val/HitRate@10": metrics["HitRate@10"],
+                "val/NDCG@10": metrics["NDCG@10"],
+                "val/SRA": metrics["SRA"],
+                "val/WSRA": metrics["WSRA"]
+            })
         # 체크포인트 저장
         checkpoint_dir = "checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -209,21 +243,30 @@ def main():
         torch.save(model.state_dict(), checkpoint_path)
     
     # 최종 테스트 평가
-    test_loss, test_metrics = evaluate(model, test_loader, device, item_embeddings, candidate_size=args.candidate_size)
-    wandb.log({
-        "test/loss": test_loss,
-        "test/accuracy": test_metrics["accuracy"],
-        "test/MRR": test_metrics["MRR"],
-        "test/HitRate@1": test_metrics["HitRate@1"],
-        "test/NDCG@1": test_metrics["NDCG@1"],
-        "test/HitRate@3": test_metrics["HitRate@3"],
-        "test/NDCG@3": test_metrics["NDCG@3"],
-        "test/HitRate@5": test_metrics["HitRate@5"],
-        "test/NDCG@5": test_metrics["NDCG@5"],
-        "test/HitRate@10": test_metrics["HitRate@10"],
-        "test/NDCG@10": test_metrics["NDCG@10"],
-        "test/NSU": test_metrics["NSU"]
-    })
+    test_loss, test_metrics = evaluate(model, 
+                                       test_loader, 
+                                       device, 
+                                       item_embeddings, 
+                                       candidate_size=args.candidate_size, 
+                                       candidate_dict= candidate_dict, 
+                                       global_candidate = args.global_candidate,
+                                       loss_strategy = args.test_strategy)
+    if not args.wandb_off:
+        wandb.log({
+            "test/loss": test_loss,
+            "test/accuracy": test_metrics["accuracy"],
+            "test/MRR": test_metrics["MRR"],
+            "test/HitRate@1": test_metrics["HitRate@1"],
+            "test/NDCG@1": test_metrics["NDCG@1"],
+            "test/HitRate@3": test_metrics["HitRate@3"],
+            "test/NDCG@3": test_metrics["NDCG@3"],
+            "test/HitRate@5": test_metrics["HitRate@5"],
+            "test/NDCG@5": test_metrics["NDCG@5"],
+            "test/HitRate@10": test_metrics["HitRate@10"],
+            "test/NDCG@10": test_metrics["NDCG@10"],
+            "test/SRA": test_metrics["SRA"],
+            "test/WSRA": test_metrics["WSRA"]
+        })
     print(f"Test Loss = {test_loss:.4f}")
 
 if __name__ == "__main__":

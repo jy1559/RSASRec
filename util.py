@@ -185,140 +185,200 @@ def build_candidate_set(batch_item_ids, candidate_size, item_embeddings, project
 
 def get_candidate_set_for_batch(batch_item_ids, candidate_size, item_embeddings, projection_ffn, candidate_dict=None, global_candidate=False):
     """
-    주어진 배치의 positive item id들을 기반으로 candidate set과 정답 인덱스를 생성합니다.
-    
-    Parameters:
-      - batch_item_ids: 리스트 (예: [item_id1, item_id2, ...]) — 각 샘플의 positive item id.
-      - candidate_size: int, candidate set의 크기.
-      - item_embeddings: dict, {item_id: embedding (numpy array)}.
-      - global_candidate: bool, True이면 모든 샘플에 대해 동일한 candidate set을 사용.
-    
+    batch_item_ids: [B, L] tensor (already padded from get_batch_item_ids)
     Returns:
-      - candidate_set_tensor: 
-            * global_candidate=False: shape은 [batch_size, candidate_size, embed_dim] 또는 
-              [batch_size, num_sessions, candidate_size, embed_dim] (2차원 리스트인 경우)
-            * global_candidate=True: [batch_size, candidate_size, embed_dim] (모든 샘플에 동일 candidate set)
-      - correct_indices_tensor: 각 샘플에 대해 정답(positive)의 인덱스를 나타내는 텐서.
+      candidate_set_tensor: [B, L_valid, candidate_size, d] where L_valid is the padded valid length for each sample
+      correct_indices_tensor: [B, L_valid] tensor
     """
-    if not global_candidate:
-        return build_candidate_set(batch_item_ids.tolist(), candidate_size, item_embeddings, projection_ffn, candidate_dict)
-    else:
-        all_item_ids = list(item_embeddings.keys())
-        if len(all_item_ids) < candidate_size:
-            candidate_ids = all_item_ids.copy()
+    device = next(projection_ffn.parameters()).device if projection_ffn is not None else torch.device('cpu')
+    B, L = batch_item_ids.shape
+    candidate_sets = []
+    correct_indices = []
+    valid_lengths = []  # 각 샘플별 valid 길이 (패딩 제외)
+    # 각 샘플별로 valid item (padding이 아닌 값)에 대해서 후보 생성
+    for b in range(B):
+        candidate_set_sample = []
+        correct_indices_sample = []
+        # valid 길이: -1이 아닌 값의 개수
+        valid_len = (batch_item_ids[b] != -1).sum().item()
+        valid_lengths.append(valid_len)
+        for l in range(valid_len):
+            item_val = int(batch_item_ids[b, l].item())
+            cand, pos_idx = build_candidate_for_item(item_val, projection_ffn, candidate_dict, item_embeddings, candidate_size, device)
+            candidate_set_sample.append(cand)  # cand: [candidate_size, d]
+            correct_indices_sample.append(pos_idx)
+        if valid_len > 0:
+            candidate_set_sample = torch.stack(candidate_set_sample, dim=0)  # [valid_len, candidate_size, d]
+            correct_indices_sample = torch.tensor(correct_indices_sample, dtype=torch.long, device=device)  # [valid_len]
         else:
-            candidate_ids = random.sample(all_item_ids, candidate_size)
-        
-        # candidate_ids에 대해 매핑 딕셔너리 구축: { candidate_id(str): index }
-        mapping = {cid: idx for idx, cid in enumerate(candidate_ids)}
-        
-        # batch_item_ids는 텐서로 들어온다고 가정하고, flatten 처리
-        flat_ids = batch_item_ids.view(-1)
-        correct_indices = []
-        for pos_id in flat_ids.tolist():
-            if pos_id == -1:
-                correct_indices.append(-1)
-            else:
-                pos_id_str = str(pos_id)
-                if pos_id_str in mapping:
-                    correct_indices.append(mapping[pos_id_str])
-                else:
-                    # candidate_ids에 없는 경우, 추가하고 그 인덱스를 반환
-                    mapping[pos_id_str] = len(mapping)
-                    candidate_ids.append(pos_id_str)
-                    correct_indices.append(mapping[pos_id_str])
-        
-        # candidate_ids에 해당하는 임베딩을 한 번에 계산.
-        device = next(projection_ffn.parameters()).device if projection_ffn is not None else torch.device('cpu')
-        candidate_set = [
-            projection_ffn(torch.tensor(item_embeddings[cid], dtype=torch.float32, device=device).unsqueeze(0)).squeeze(0)
-            for cid in candidate_ids
-        ]
-        # torch.stack으로 candidate_set 텐서를 만듦: [candidate_size, embed_dim]
-        candidate_set_tensor = torch.stack(candidate_set, dim=0)
-        
-        # correct_indices를 원래 배치 shape으로 복원
-        correct_indices_tensor = torch.tensor(correct_indices, dtype=torch.long).view(batch_item_ids.shape)
-        
-        return candidate_set_tensor, correct_indices_tensor
+            # 만약 valid item이 없다면 (드물겠지만) 0 길이 tensor 생성
+            candidate_set_sample = torch.zeros((0, candidate_size, projection_ffn.fc1.out_features), device=device)
+            correct_indices_sample = torch.zeros((0,), dtype=torch.long, device=device)
+        candidate_sets.append(candidate_set_sample)
+        correct_indices.append(correct_indices_sample)
+    # 배치 내 최대 valid 길이
+    max_len = max(valid_lengths) if valid_lengths else 0
+    # 각 샘플별로 max_len으로 pad (pad: candidate embedding은 0, 정답 인덱스는 -1)
+    padded_candidate_sets = []
+    padded_correct_indices = []
+    for cs, ci, v_len in zip(candidate_sets, correct_indices, valid_lengths):
+        if v_len < max_len:
+            pad_tensor = torch.zeros((max_len - v_len, cs.shape[1], cs.shape[2]), device=cs.device)
+            cs_padded = torch.cat([cs, pad_tensor], dim=0)
+            ci_pad = torch.full((max_len - v_len,), -1, dtype=torch.long, device=ci.device)
+            ci_padded = torch.cat([ci, ci_pad], dim=0)
+        else:
+            cs_padded = cs
+            ci_padded = ci
+        padded_candidate_sets.append(cs_padded)
+        padded_correct_indices.append(ci_padded)
+    candidate_set_tensor = torch.stack(padded_candidate_sets, dim=0)  # [B, max_len, candidate_size, d]
+    correct_indices_tensor = torch.stack(padded_correct_indices, dim=0)  # [B, max_len]
+    
+    if global_candidate:
+        all_candidate_ids = list(item_embeddings.keys())[:candidate_size]
+        candidate_set_tensor = torch.tensor(all_candidate_ids, dtype=torch.long, device=device)
+        correct_indices_tensor = torch.zeros(B, L, dtype=torch.long, device=device)
+    return candidate_set_tensor, correct_indices_tensor
 
 
-def get_batch_item_ids(item_ids, strategy='EachSession_LastInter'):
+
+def get_batch_item_ids(item_ids, strategy):
     """
-    item_ids: [B, S, I] 텐서 또는 리스트 (패딩은 -1)
-    strategy:
-      - 'EachSession_LastInter': 각 세션별 마지막 valid item id → [B, S] 텐서
-      - 'Global_LastInter': 각 user 전체에서 마지막 valid item id → [B] 텐서
-      - 'LastSession_AllInter': 각 user의 마지막 valid session의 valid item id들을
-                                 최대 길이(max_valid)로 padding하여 [B, max_valid] 텐서로 반환.
+    item_ids: [B, S, I] tensor (padding은 -1)
+    strategy: 선택 전략 (예: 'EachSession_LastInter', 'Global_LastInter', ...)
     
     Returns:
-      batch_item_ids: 고정 shape의 텐서 (정수형, -1은 padding)
+      selected_ids: [B, max_len] tensor (각 sample에서 선택된 item id 목록, padding=-1)
+      loss_mask: [B, max_len] Boolean tensor (True이면 해당 위치를 loss 계산에 포함)
+      session_ids: [B, max_len] tensor (각 위치의 item이 어느 세션에서 선택되었는지; padding=-1)
     """
-    # 만약 tensor라면 리스트로 변환하지 않고 텐서 연산으로 처리합니다.
-    # 우선, ensure tensor type
-    if not torch.is_tensor(item_ids):
-        item_ids = torch.tensor(item_ids, dtype=torch.int32)
-    
     B, S, I = item_ids.shape
+    results = []         # 각 sample별 selected item id list
+    mask_results = []    # 각 sample별 valid 여부 (True: valid)
+    session_results = [] # 각 sample별, 해당 item이 나온 session id
     
     if strategy == 'EachSession_LastInter':
-        # item_ids: [B, S, I]
-        initial_valid = (item_ids != -1)  # [B, S, I]
-        # 한 세션 내에서, 한 번이라도 -1이 나오면 그 이후는 모두 False로 만듦
-        valid_mask = torch.cumprod(initial_valid.to(torch.int32), dim=-1).bool()
-        
-        rev_mask = valid_mask.flip(dims=[-1])
-        rev_first_valid_idx = torch.argmax(rev_mask.to(torch.int32), dim=-1)  # [B, S]
-        last_valid_idx = I - 1 - rev_first_valid_idx  # [B, S]
-        
-        # valid item이 전혀 없는 세션의 경우
-        no_valid = (valid_mask.sum(dim=-1) == 0)
-        # torch.gather는 음수 인덱스를 허용하지 않으므로, 임시로 0으로 채워줌
-        gather_idx = last_valid_idx.clone()
-        gather_idx[no_valid] = 0
-        
-        gathered = torch.gather(item_ids, dim=2, index=gather_idx.unsqueeze(-1)).squeeze(-1)
-        # valid한 값이 없었던 세션은 -1로 설정
-        gathered[no_valid] = -1
-        return gathered  # [B, S]
-    
-    elif strategy == 'Global_LastInter':
-        # Flatten [B, S, I] → [B, S*I]
-        flat_ids = item_ids.view(B, S * I)
-        valid_mask = (flat_ids != -1)
-        rev_mask = valid_mask.flip(dims=[-1])
-        rev_first_valid_idx = torch.argmax(rev_mask.to(torch.int32), dim=-1)  # [B]
-        last_valid_idx = S * I - 1 - rev_first_valid_idx  # [B]
-        last_items = torch.gather(flat_ids, dim=1, index=last_valid_idx.unsqueeze(-1)).squeeze(-1)
-        return last_items  # [B]    
-    
-    elif strategy == 'LastSession_AllInter':
-        # 각 user의 마지막 valid session에서 valid item id들을 추출하여 padding
-        # session_valid: [B, S]
-        session_valid = (item_ids != -1).any(dim=-1)
-        rev_session_valid = session_valid.flip(dims=[1])
-        last_session_idx = S - 1 - torch.argmax(rev_session_valid.to(torch.int32), dim=1)  # [B]
-        
-        # For each sample, extract the valid item ids from that session.
-        batch_list = []
-        max_len = 0
         for b in range(B):
-            sess_ids = item_ids[b, last_session_idx[b], :]  # [I]
-            valid_ids = sess_ids[sess_ids != -1]
-            max_len = max(max_len, valid_ids.numel())
-            batch_list.append(valid_ids)
-        # Pad each valid_ids to length max_len with -1
-        padded = []
-        for valid_ids in batch_list:
-            pad_length = max_len - valid_ids.numel()
-            if pad_length > 0:
-                pad_tensor = torch.full((pad_length,), -1, dtype=valid_ids.dtype)
-                padded_ids = torch.cat([valid_ids, pad_tensor], dim=0)
+            chosen = []
+            sess_ids = []
+            for s in range(S):
+                session = item_ids[b, s, :]  # [I]
+                valid_indices = (session != -1).nonzero(as_tuple=False).squeeze(-1)
+                if valid_indices.numel() > 0:
+                    last_index = valid_indices[-1].item()
+                    chosen.append(session[last_index].item())
+                    sess_ids.append(s)
+            results.append(chosen)
+            mask_results.append([True] * len(chosen))
+            session_results.append(sess_ids)
+            
+    elif strategy == 'Global_LastInter':
+        for b in range(B):
+            flat = item_ids[b].view(-1)  # [S*I]
+            valid_indices = (flat != -1).nonzero(as_tuple=False).squeeze(-1)
+            if valid_indices.numel() > 0:
+                last_index = valid_indices[-1].item()
+                chosen_item = flat[last_index].item()
+                # session id 계산: last_index // I
+                sess_id = last_index // I
+                results.append([chosen_item])
+                mask_results.append([True])
+                session_results.append([sess_id])
             else:
-                padded_ids = valid_ids
-            padded.append(padded_ids.unsqueeze(0))
-        return torch.cat(padded, dim=0)  # [B, max_len]
-    
+                results.append([])
+                mask_results.append([])
+                session_results.append([])
+                
+    elif strategy == 'LastSession_AllInter':
+        for b in range(B):
+            valid_sessions = [ (item_ids[b, s, :] != -1).any().item() for s in range(S) ]
+            valid_session_indices = [s for s, valid in enumerate(valid_sessions) if valid]
+            if valid_session_indices:
+                last_session = valid_session_indices[-1]
+                session_vec = item_ids[b, last_session, :]
+                valid_items = session_vec[session_vec != -1]
+                chosen = valid_items.tolist()
+                sess_ids = [last_session] * len(chosen)
+            else:
+                chosen = []
+                sess_ids = []
+            results.append(chosen)
+            mask_results.append([True] * len(chosen))
+            session_results.append(sess_ids)
+            
+    elif strategy == 'AllInter_ExceptFirst':
+        for b in range(B):
+            flat = item_ids[b].view(-1)
+            valid = flat[flat != -1]
+            indices = (flat != -1).nonzero(as_tuple=False).squeeze(-1)
+            if indices.numel() > 0:
+                indices = indices[1:]  # 첫 번째 제외
+                chosen = flat[indices].tolist()
+                sess_ids = (indices // I).tolist()
+            else:
+                chosen = []
+                sess_ids = []
+            results.append(chosen)
+            mask_results.append([True] * len(chosen))
+            session_results.append(sess_ids)
+            
+    elif strategy == 'AllInter':
+        for b in range(B):
+            flat = item_ids[b].view(-1)
+            indices = (flat != -1).nonzero(as_tuple=False).squeeze(-1)
+            chosen = flat[indices].tolist()
+            sess_ids = (indices // I).tolist()
+            results.append(chosen)
+            mask_results.append([True] * len(chosen))
+            session_results.append(sess_ids)
+            
+    elif strategy == 'EachSession_First_and_Last_Inter':
+        for b in range(B):
+            chosen = []
+            sess_ids = []
+            for s in range(S):
+                session = item_ids[b, s, :]
+                valid_indices = (session != -1).nonzero(as_tuple=False).squeeze(-1)
+                if valid_indices.numel() > 0:
+                    first_index = valid_indices[0].item()
+                    last_index = valid_indices[-1].item()
+                    chosen.extend([session[first_index].item(), session[last_index].item()])
+                    sess_ids.extend([s, s])
+            results.append(chosen)
+            mask_results.append([True] * len(chosen))
+            session_results.append(sess_ids)
+            
+    elif strategy == 'EachSession_Except_First':
+        for b in range(B):
+            chosen = []
+            sess_ids = []
+            for s in range(S):
+                session = item_ids[b, s, :]
+                valid = session[session != -1]
+                if valid.numel() > 0:
+                    remainder = valid[1:]
+                    chosen.extend(remainder.tolist())
+                    sess_ids.extend([s] * remainder.numel())
+            results.append(chosen)
+            mask_results.append([True] * len(chosen))
+            session_results.append(sess_ids)
+            
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
+    
+    # 배치 내 최대 길이(max_len)로 padding (-1 for item id, False for mask, -1 for session id)
+    max_len = max(len(r) for r in results) if results else 0
+    padded_ids = []
+    padded_mask = []
+    padded_session_ids = []
+    for r, m, s in zip(results, mask_results, session_results):
+        pad_len = max_len - len(r)
+        padded_ids.append(r + [-1] * pad_len)
+        padded_mask.append(m + [False] * pad_len)
+        padded_session_ids.append(s + [-1] * pad_len)
+    
+    selected_ids = torch.tensor(padded_ids, dtype=item_ids.dtype, device=item_ids.device)
+    loss_mask = torch.tensor(padded_mask, dtype=torch.bool, device=item_ids.device)
+    session_ids = torch.tensor(padded_session_ids, dtype=torch.long, device=item_ids.device)
+    return selected_ids, loss_mask, session_ids
