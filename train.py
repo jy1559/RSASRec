@@ -87,7 +87,7 @@ def train_one_epoch(model, dataloader, optimizer, device, candidate_size, global
         optimizer.step()
         
         total_loss += loss.item()
-        if wandb_logging and batch_counter % 5 == 0:
+        if wandb_logging and batch_counter % 1 == 0:
             wandb.log({
                 "train/loss": loss.item(),
                 "train/accuracy": metric["accuracy"],
@@ -128,7 +128,7 @@ def evaluate(model, dataloader, device, item_embeddings, candidate_size, candida
             
             candidate_set, correct_indices = get_candidate_set_for_batch(
                 batch_item_ids,
-                candidate_size,
+                candidate_size = -1,
                 item_embeddings=item_embeddings,
                 projection_ffn=model.projection_ffn,
                 candidate_dict=candidate_dict,
@@ -215,7 +215,7 @@ def main():
                                      item_embeddings, 
                                      candidate_size=args.candidate_size, 
                                      candidate_dict = candidate_dict, 
-                                     global_candidate = args.global_candidate,
+                                     global_candidate = True, #args.global_candidate,
                                      loss_strategy = args.test_strategy)
         print(f"Epoch {epoch}/{args.num_epochs}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Val metrics: {metrics}")
         if not args.wandb_off:
@@ -249,7 +249,7 @@ def main():
                                        item_embeddings, 
                                        candidate_size=args.candidate_size, 
                                        candidate_dict= candidate_dict, 
-                                       global_candidate = args.global_candidate,
+                                       global_candidate = True, #args.global_candidate,
                                        loss_strategy = args.test_strategy)
     if not args.wandb_off:
         wandb.log({
