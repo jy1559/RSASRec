@@ -10,7 +10,21 @@ from .sub5_FFN import preprocess_inputs, create_ffn_model
 
 from time import time
 from tqdm.auto import tqdm
+import time
+import wandb
 
+class Timer:
+    def __init__(self, name, wandb_logging):
+        self.name = name
+        self.logging = wandb_logging
+    def __enter__(self):
+        self.start = time.time()
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        elapsed = time.time() - self.start
+        if self.logging:
+            wandb.log({f"Timing/{self.name}": elapsed})
+        
 # --- LoRA 관련 코드 ---
 class LoRALinear(nn.Module):
     """

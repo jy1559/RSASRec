@@ -7,6 +7,20 @@ from tqdm.auto import tqdm
 import torch.nn.functional as F
 import numpy as np
 from models.sub1_sequence_embedding import sentence_embedder, mean_pooling
+import time
+import wandb
+
+class Timer:
+    def __init__(self, name, wandb_logging):
+        self.name = name
+        self.logging = wandb_logging
+    def __enter__(self):
+        self.start = time.time()
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        elapsed = time.time() - self.start
+        if self.logging:
+            wandb.log({f"Timing/{self.name}": elapsed})
 
 def compute_and_save_item_embeddings(metadata_path, output_path, hf_model_path='sentence-transformers/all-MiniLM-L6-v2', batch_size=128, device='cuda:0'):
     """
@@ -192,53 +206,94 @@ def get_candidate_set_for_batch(batch_item_ids, candidate_size, item_embeddings,
     """
     device = next(projection_ffn.parameters()).device if projection_ffn is not None else torch.device('cpu')
     B, L = batch_item_ids.shape
-    candidate_sets = []
-    correct_indices = []
-    valid_lengths = []  # 각 샘플별 valid 길이 (패딩 제외)
-    # 각 샘플별로 valid item (padding이 아닌 값)에 대해서 후보 생성
-    for b in range(B):
-        candidate_set_sample = []
-        correct_indices_sample = []
-        # valid 길이: -1이 아닌 값의 개수
-        valid_len = (batch_item_ids[b] != -1).sum().item()
-        valid_lengths.append(valid_len)
-        for l in range(valid_len):
-            item_val = int(batch_item_ids[b, l].item())
-            cand, pos_idx = build_candidate_for_item(item_val, projection_ffn, candidate_dict, item_embeddings, candidate_size, device)
-            candidate_set_sample.append(cand)  # cand: [candidate_size, d]
-            correct_indices_sample.append(pos_idx)
-        if valid_len > 0:
-            candidate_set_sample = torch.stack(candidate_set_sample, dim=0)  # [valid_len, candidate_size, d]
-            correct_indices_sample = torch.tensor(correct_indices_sample, dtype=torch.long, device=device)  # [valid_len]
-        else:
-            # 만약 valid item이 없다면 (드물겠지만) 0 길이 tensor 생성
-            candidate_set_sample = torch.zeros((0, candidate_size, projection_ffn.fc1.out_features), device=device)
-            correct_indices_sample = torch.zeros((0,), dtype=torch.long, device=device)
-        candidate_sets.append(candidate_set_sample)
-        correct_indices.append(correct_indices_sample)
-    # 배치 내 최대 valid 길이
-    max_len = max(valid_lengths) if valid_lengths else 0
-    # 각 샘플별로 max_len으로 pad (pad: candidate embedding은 0, 정답 인덱스는 -1)
-    padded_candidate_sets = []
-    padded_correct_indices = []
-    for cs, ci, v_len in zip(candidate_sets, correct_indices, valid_lengths):
-        if v_len < max_len:
-            pad_tensor = torch.zeros((max_len - v_len, cs.shape[1], cs.shape[2]), device=cs.device)
-            cs_padded = torch.cat([cs, pad_tensor], dim=0)
-            ci_pad = torch.full((max_len - v_len,), -1, dtype=torch.long, device=ci.device)
-            ci_padded = torch.cat([ci, ci_pad], dim=0)
-        else:
-            cs_padded = cs
-            ci_padded = ci
-        padded_candidate_sets.append(cs_padded)
-        padded_correct_indices.append(ci_padded)
-    candidate_set_tensor = torch.stack(padded_candidate_sets, dim=0)  # [B, max_len, candidate_size, d]
-    correct_indices_tensor = torch.stack(padded_correct_indices, dim=0)  # [B, max_len]
-    
-    if global_candidate:
-        all_candidate_ids = list(item_embeddings.keys())[:candidate_size]
-        candidate_set_tensor = torch.tensor(all_candidate_ids, dtype=torch.long, device=device)
-        correct_indices_tensor = torch.zeros(B, L, dtype=torch.long, device=device)
+
+    if not global_candidate:
+        # 기존 로직 유지
+        candidate_sets = []
+        correct_indices = []
+        valid_lengths = []  # 각 샘플별 valid 길이 (패딩 제외)
+        for b in range(B):
+            candidate_set_sample = []
+            correct_indices_sample = []
+            valid_len = (batch_item_ids[b] != -1).sum().item()
+            valid_lengths.append(valid_len)
+            for l in range(valid_len):
+                item_val = int(batch_item_ids[b, l].item())
+                cand, pos_idx = build_candidate_for_item(item_val, projection_ffn, candidate_dict, item_embeddings, candidate_size, device)
+                candidate_set_sample.append(cand)
+                correct_indices_sample.append(pos_idx)
+            if valid_len > 0:
+                candidate_set_sample = torch.stack(candidate_set_sample, dim=0)  # [valid_len, candidate_size, d]
+                correct_indices_sample = torch.tensor(correct_indices_sample, dtype=torch.long, device=device)
+            else:
+                candidate_set_sample = torch.zeros((0, candidate_size, projection_ffn.fc1.out_features), device=device)
+                correct_indices_sample = torch.zeros((0,), dtype=torch.long, device=device)
+            candidate_sets.append(candidate_set_sample)
+            correct_indices.append(correct_indices_sample)
+        max_len = max(valid_lengths) if valid_lengths else 0
+        padded_candidate_sets = []
+        padded_correct_indices = []
+        for cs, ci, v_len in zip(candidate_sets, correct_indices, valid_lengths):
+            if v_len < max_len:
+                pad_tensor = torch.zeros((max_len - v_len, cs.shape[1], cs.shape[2]), device=cs.device)
+                cs_padded = torch.cat([cs, pad_tensor], dim=0)
+                ci_pad = torch.full((max_len - v_len,), -1, dtype=torch.long, device=ci.device)
+                ci_padded = torch.cat([ci, ci_pad], dim=0)
+            else:
+                cs_padded = cs
+                ci_padded = ci
+            padded_candidate_sets.append(cs_padded)
+            padded_correct_indices.append(ci_padded)
+        candidate_set_tensor = torch.stack(padded_candidate_sets, dim=0)  # [B, max_len, candidate_size, d]
+        correct_indices_tensor = torch.stack(padded_correct_indices, dim=0)  # [B, max_len]
+    else:
+         # Global candidate 모드
+        # 1. 배치에서 사용된 모든 positive item id (item id는 int, padding=-1)
+        pos_ids = set()
+        B, L = batch_item_ids.shape
+        for b in range(B):
+            for x in batch_item_ids[b]:
+                val = int(x.item())
+                if val != -1:
+                    pos_ids.add(val)
+        # 2. 초기 후보 집합은 item_embeddings의 키에서 후보_size개 선택.
+        #    item_embeddings의 key들은 보통 str이므로, 변환.
+        try:
+            initial_candidates = [int(key) for key in item_embeddings.keys()]
+        except Exception:
+            initial_candidates = [key for key in item_embeddings.keys()]
+        initial_candidates = initial_candidates[:candidate_size]
+        # 3. 모든 positive item id가 후보 집합에 포함되도록.
+        for pos_id in sorted(pos_ids):
+            if pos_id not in initial_candidates:
+                initial_candidates.append(pos_id)
+        # 4. 최종 global 후보 집합의 크기:
+        final_candidate_size = len(initial_candidates)
+        # 5. 각 candidate id에 대해 embedding 가져오기 (projection 적용)
+        candidate_embeddings = []
+        for cid in initial_candidates:
+            emb = torch.tensor(item_embeddings[str(cid)], dtype=torch.float32, device=device)
+            if projection_ffn is not None:
+                emb = projection_ffn(emb.unsqueeze(0)).squeeze(0)
+            candidate_embeddings.append(emb)
+        candidate_set_tensor = torch.stack(candidate_embeddings, dim=0)  # [final_candidate_size, d]
+        # 6. correct_indices_tensor: 각 positive item id in batch_item_ids에 대해, 후보 집합 내 index 계산.
+        correct_indices = []
+        for b in range(B):
+            sample_ids = batch_item_ids[b].tolist()  # list of ints (padding -1)
+            sample_correct = []
+            for x in sample_ids:
+                if x != -1:
+                    try:
+                        idx = initial_candidates.index(x)
+                        sample_correct.append(idx)
+                    except ValueError:
+                        sample_correct.append(-1)
+                else:
+                    sample_correct.append(-1)
+            correct_indices.append(sample_correct)
+        correct_indices_tensor = torch.tensor(correct_indices, dtype=torch.long, device=device)
+        print(f'Global candidate set size: {candidate_set_tensor.shape}')
     return candidate_set_tensor, correct_indices_tensor
 
 
