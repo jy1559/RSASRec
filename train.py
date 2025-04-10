@@ -17,7 +17,7 @@ from optimizer import get_optimizer
 # loss 계산 모듈
 from loss import compute_loss
 # candidate set 및 정답 인덱스 생성을 위한 util 함수
-from util import get_candidate_set_for_batch, get_batch_item_ids, load_item_embeddings
+from util import get_candidate_set_for_batch, get_batch_item_ids, load_item_embeddings, Timer
 # (실제 item 임베딩은 사전 계산 후 로드하여 사용해야 함. 여기서는 placeholder로 처리)
 
 def parse_args():
@@ -55,36 +55,42 @@ def train_one_epoch(model, dataloader, optimizer, device, candidate_size, global
     for batch in pbar:
         batch_counter += 1
         # batch 내 tensor들은 device로 이동 (문자열은 그대로 유지)
-        batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+        with Timer("batch_to_device", wandb_logging):
+            batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
         optimizer.zero_grad()
 
         # 모델 forward
-        output_features, updated_user_embedding = model(batch)
+        with Timer("model_forward", wandb_logging):
+            output_features, updated_user_embedding = model(batch)
         
         # get_batch_item_ids는 [B, max_len]와 loss_mask ([B, max_len])를 반환
-        batch_item_ids, loss_mask, session_ids = get_batch_item_ids(batch['item_id'], strategy=train_strategy)
-        
-        candidate_set, correct_indices = get_candidate_set_for_batch(
-            batch_item_ids,
-            candidate_size,
-            item_embeddings=item_embeddings,
-            projection_ffn=model.projection_ffn,
-            candidate_dict=candidate_dict,
-            global_candidate=global_candidate
-        )
+        with Timer("get_batch_item_ids", wandb_logging):
+            batch_item_ids, loss_mask, session_ids = get_batch_item_ids(batch['item_id'], strategy=train_strategy)
+
+        with Timer("get_candidate_set_for_batch", wandb_logging):
+            candidate_set, correct_indices = get_candidate_set_for_batch(
+                batch_item_ids,
+                candidate_size,
+                item_embeddings=item_embeddings,
+                projection_ffn=model.projection_ffn,
+                candidate_dict=candidate_dict,
+                global_candidate=global_candidate
+            )
         candidate_set = candidate_set.to(device)
         correct_indices = correct_indices.to(device)
         
-        loss, metric = compute_loss(
-            output_features, candidate_set, correct_indices,
-            strategy=train_strategy,
-            global_candidate=global_candidate,
-            loss_mask=loss_mask,
-            session_ids=session_ids
-        )
+        with Timer("compute_loss", wandb_logging):
+            loss, metric = compute_loss(
+                output_features, candidate_set, correct_indices,
+                strategy=train_strategy,
+                global_candidate=global_candidate,
+                loss_mask=loss_mask,
+                session_ids=session_ids
+            )
         
-        loss.backward()
-        optimizer.step()
+        with Timer("loss_backward", wandb_logging):
+            loss.backward()
+            optimizer.step()
         
         total_loss += loss.item()
         if wandb_logging and batch_counter % 1 == 0:

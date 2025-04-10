@@ -7,6 +7,20 @@ from tqdm.auto import tqdm
 import torch.nn.functional as F
 import numpy as np
 from models.sub1_sequence_embedding import sentence_embedder, mean_pooling
+import time
+import wandb
+
+class Timer:
+    def __init__(self, name, wandb_logging):
+        self.name = name
+        self.logging = wandb_logging
+    def __enter__(self):
+        self.start = time.time()
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        elapsed = time.time() - self.start
+        if self.logging:
+            wandb.log({f"Timing/{self.name}": elapsed})
 
 def compute_and_save_item_embeddings(metadata_path, output_path, hf_model_path='sentence-transformers/all-MiniLM-L6-v2', batch_size=128, device='cuda:0'):
     """
