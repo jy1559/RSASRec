@@ -11,16 +11,17 @@ import time
 import wandb
 
 class Timer:
-    def __init__(self, name, wandb_logging):
+    def __init__(self, name, wandb_logging, batch_counter):
         self.name = name
         self.logging = wandb_logging
+        self.batch_counter = batch_counter
     def __enter__(self):
         self.start = time.time()
         return self
     def __exit__(self, exc_type, exc_val, exc_tb):
         elapsed = time.time() - self.start
         if self.logging:
-            wandb.log({f"Timing/{self.name}": elapsed})
+            wandb.log({f"Timing/{self.name}": elapsed}, step=self.batch_counter)
 
 def compute_and_save_item_embeddings(metadata_path, output_path, hf_model_path='sentence-transformers/all-MiniLM-L6-v2', batch_size=128, device='cuda:0'):
     """
@@ -69,75 +70,85 @@ def compute_and_save_item_embeddings(metadata_path, output_path, hf_model_path='
     return embeddings
 
 
-def load_item_embeddings(embedding_file_path):
+def load_item_embeddings(embedding_file_path, device):
     """
-    저장된 item embedding pickle 파일을 로드합니다.
+    전처리된 _revised item_embedding_normalized 파일을 로드하여, 
+    [N+1, embedding_dim] tensor를 반환합니다.
+    (index 0은 padding용 0 벡터, 나머지는 연속된 new index 순서대로 저장됨)
     
-    Parameters:
-    - embedding_file_path: str, embedding pickle 파일 경로.
-    
+    Args:
+      file_path: str, 전처리된 pickle 파일 경로 (예: item_embedding_normalized_revised.pickle)
+      device: torch.device
+      
     Returns:
-    - embeddings: dict, {item_id: embedding (numpy array)}
+      item_embeddings_tensor: [N+1, embedding_dim] tensor, device로 이동됨.
     """
     with open(embedding_file_path, 'rb') as f:
-        embeddings = pickle.load(f)
-    return embeddings
+        data = pickle.load(f)
+    # data는 {'embedding_tensor': tensor, 'id2index': mapping} 형태이나,
+    # 여기서는 id2index가 필요 없으므로 embedding_tensor만 반환합니다.
+    embedding_tensor = data['embedding_tensor']
+    return embedding_tensor.to(device)
 
-def build_candidate_for_item(item_id, projection_ffn, candidate_dict, item_embeddings, candidate_size, device):
+def load_candidate_tensor(candidate_file, candidate_size, device):
     """
-    주어진 item_id에 대해 후보 임베딩들을 반환합니다.
-    기존 랜덤 샘플링 대신, 미리 저장된 candidate_dict(npz에서 불러온 후보 세트)를 사용합니다.
+    전처리된 _revised candidate_sets 파일을 로드하여,
+    [N+1, candidate_size-1] tensor를 반환합니다.
     
-    Parameters:
-    - item_id: int, 처리할 아이템 id (padding은 -1)
-    - projection_ffn: nn.Module, 단층 projector (예: nn.Linear(384, 128))
-    - candidate_dict: dict, {item_id (int): list of candidate item ids (int)} precomputed 후보 세트
-    - item_embeddings: dict, {str(item_id): numpy array} 형태의 precomputed item 임베딩
-    - candidate_size: int, 최종 후보 세트 크기 (예: 128)
+    Args:
+      file_path: str, 전처리된 npz 파일 경로 (예: candidate_sets_revised.npz)
+      device: torch.device
+      
+    Returns:
+      candidate_tensor: [N+1, candidate_size-1] long tensor, device로 이동됨.
+    """
+    data = np.load(candidate_file)
+    # 저장된 candidate_tensor가 "candidate_tensor" 키에 저장됨.
+    candidate_tensor_np = data['candidate_tensor']
+    # candidate_size 열만 slice합니다.
+    candidate_tensor_np = candidate_tensor_np[:, :candidate_size]
+    candidate_tensor = torch.tensor(candidate_tensor_np, dtype=torch.long, device=device)
+    return candidate_tensor
+
+def build_candidate_for_item(item_id, projection_ffn, candidate_tensor, item_embeddings_tensor, candidate_size, device):
+    """
+    주어진 item_id (이미 new index로 변환된 값)에 대해 후보 임베딩들을 반환합니다.
+    이전 dict 기반 방식 대신, 전처리된 candidate_tensor (shape: [N+1, candidate_size])와
+    item_embeddings_tensor (shape: [N+1, base_dim])를 사용합니다.
+    
+    처리 로직:
+      - 만약 item_id가 -1 (패딩)인 경우, candidate 크기(candidate_size)만큼 0 벡터를 반환.
+      - 그렇지 않은 경우, positive 후보는 item_id 자신이며,
+        negative 후보는 candidate_tensor[item_id]의 처음 candidate_size-1 값을 사용합니다.
+      - 따라서 최종 후보 리스트는 torch.cat([ [item_id], candidate_tensor[item_id][:candidate_size-1] ])
+        형태가 되어 총 candidate_size개가 됩니다.
+      - 이 candidate id 리스트로부터 item_embeddings_tensor에서 임베딩을 lookup하고,
+        단층 projection (projection_ffn)을 적용하여 최종 후보 임베딩 ([candidate_size, d])를 리턴합니다.
     
     Returns:
-    - candidate_embeddings_shuffled: list of [emb_dim] torch.Tensor (단층 projector 적용 후)
-    - pos_index: int, positive candidate의 인덱스 (여기서는 항상 0)
+      candidate_embeddings_tensor: [candidate_size, d] tensor (projection_ffn 적용 후)
+      pos_index: int, positive candidate의 index (항상 0)
     """
-    # 패딩된 경우: item_id가 -1이면, 동일한 크기의 0 벡터 후보 세트를 반환
     if item_id == -1:
-        emb_dim = projection_ffn.fc2.out_features if hasattr(projection_ffn, "fc2") else projection_ffn.fc1.out_features
-        zero_emb = torch.zeros(emb_dim, dtype=torch.float32, device=device)
-        candidate_embeddings_shuffled = [zero_emb for _ in range(candidate_size)]
+        d = projection_ffn(item_embeddings_tensor[0:1]).shape[-1]
+        zero_emb = torch.zeros(d, dtype=torch.float32, device=device)
+        candidate_embeddings_tensor = torch.stack([zero_emb for _ in range(candidate_size)], dim=0)
         pos_index = -1
-        return torch.stack(candidate_embeddings_shuffled, dim=0), pos_index
+        return candidate_embeddings_tensor, pos_index
 
-    # Positive candidate: 자기 자신의 임베딩 (반드시 후보 세트의 첫 번째 위치로)
-    positive_emb = torch.tensor(item_embeddings[str(item_id)], dtype=torch.float32, device=device)
+    # positive candidate: item_id 자신
+    pos_tensor = torch.tensor([item_id], dtype=torch.long, device=device)
+    # negative candidates: candidate_tensor[item_id][:candidate_size-1]
+    neg_tensor = candidate_tensor[item_id, :candidate_size-1]  # shape: [candidate_size-1]
+    # 전체 candidate_ids: [candidate_size]
+    candidate_ids = torch.cat([pos_tensor, neg_tensor], dim=0)
     
-    # 미리 저장된 후보 세트에서 해당 아이템의 후보들을 조회 (candidate_dict는 int:item id -> list[int])
-    if item_id in candidate_dict:
-        candidate_list = [item_id] + candidate_dict[item_id]
-    else:
-        candidate_list = [item_id]
+    # Lookup base embeddings: item_embeddings_tensor는 [N+1, base_dim]
+    base_embs = item_embeddings_tensor[candidate_ids]  # [candidate_size, base_dim]
+    # Apply projection_ffn vectorized: 결과 [candidate_size, d]
+    candidate_embeddings_tensor = projection_ffn(base_embs)
     
-    if len(candidate_list) != candidate_size:
-        raise ValueError(f"Candidate set length for item {item_id} is {len(candidate_list)}, expected {candidate_size}.")
-    
-    # 각 후보 item id에 대해, item_embeddings에서 base 임베딩을 조회합니다.
-    candidate_embeddings = []
-    for cid in candidate_list:
-        if cid == -1:
-            emb = torch.zeros(positive_emb.shape, dtype=torch.float32, device=device)
-        else:
-            emb = torch.tensor(item_embeddings[str(cid)], dtype=torch.float32, device = device)
-        candidate_embeddings.append(emb)
-    
-    # 단층 projector 적용: 각 candidate embedding에 대해 projection_ffn (입력 384 -> 출력 128)을 적용합니다.
-    if projection_ffn is not None:
-        candidate_embeddings = [projection_ffn(emb.unsqueeze(0)).squeeze(0) for emb in candidate_embeddings]
-    
-    # positive candidate는 item_id 자신이므로 index 0로 둡니다.
     pos_index = 0
-    if isinstance(candidate_embeddings, list):
-        candidate_embeddings_tensor = torch.stack(candidate_embeddings, dim=0)
-    else:
-        candidate_embeddings_tensor = candidate_embeddings
     return candidate_embeddings_tensor, pos_index
 
 def build_candidate_set(batch_item_ids, candidate_size, item_embeddings, projection_ffn, candidate_dict):
@@ -197,7 +208,7 @@ def build_candidate_set(batch_item_ids, candidate_size, item_embeddings, project
     
     return candidate_set_tensor, correct_indices_tensor
 
-def get_candidate_set_for_batch(batch_item_ids, candidate_size, item_embeddings, projection_ffn, candidate_dict=None, global_candidate=False):
+def get_candidate_set_for_batch(batch_item_ids, candidate_size, item_embeddings_tensor, projection_ffn, candidate_tensor=None, global_candidate=False):
     """
     batch_item_ids: [B, L] tensor (already padded from get_batch_item_ids)
     Returns:
@@ -219,7 +230,7 @@ def get_candidate_set_for_batch(batch_item_ids, candidate_size, item_embeddings,
             valid_lengths.append(valid_len)
             for l in range(valid_len):
                 item_val = int(batch_item_ids[b, l].item())
-                cand, pos_idx = build_candidate_for_item(item_val, projection_ffn, candidate_dict, item_embeddings, candidate_size, device)
+                cand, pos_idx = build_candidate_for_item(item_val, projection_ffn, candidate_tensor, item_embeddings_tensor, candidate_size, device)
                 candidate_set_sample.append(cand)
                 correct_indices_sample.append(pos_idx)
             if valid_len > 0:
@@ -247,53 +258,20 @@ def get_candidate_set_for_batch(batch_item_ids, candidate_size, item_embeddings,
         candidate_set_tensor = torch.stack(padded_candidate_sets, dim=0)  # [B, max_len, candidate_size, d]
         correct_indices_tensor = torch.stack(padded_correct_indices, dim=0)  # [B, max_len]
     else:
-         # Global candidate 모드
-        # 1. 배치에서 사용된 모든 positive item id (item id는 int, padding=-1)
-        pos_ids = set()
-        B, L = batch_item_ids.shape
-        for b in range(B):
-            for x in batch_item_ids[b]:
-                val = int(x.item())
-                if val != -1:
-                    pos_ids.add(val)
-        # 2. 초기 후보 집합은 item_embeddings의 키에서 후보_size개 선택.
-        #    item_embeddings의 key들은 보통 str이므로, 변환.
-        try:
-            initial_candidates = [int(key) for key in item_embeddings.keys()]
-        except Exception:
-            initial_candidates = [key for key in item_embeddings.keys()]
-        initial_candidates = initial_candidates[:candidate_size]
-        # 3. 모든 positive item id가 후보 집합에 포함되도록.
-        for pos_id in sorted(pos_ids):
-            if pos_id not in initial_candidates:
-                initial_candidates.append(pos_id)
-        # 4. 최종 global 후보 집합의 크기:
-        final_candidate_size = len(initial_candidates)
-        # 5. 각 candidate id에 대해 embedding 가져오기 (projection 적용)
-        candidate_embeddings = []
-        for cid in initial_candidates:
-            emb = torch.tensor(item_embeddings[str(cid)], dtype=torch.float32, device=device)
-            if projection_ffn is not None:
-                emb = projection_ffn(emb.unsqueeze(0)).squeeze(0)
-            candidate_embeddings.append(emb)
-        candidate_set_tensor = torch.stack(candidate_embeddings, dim=0)  # [final_candidate_size, d]
-        # 6. correct_indices_tensor: 각 positive item id in batch_item_ids에 대해, 후보 집합 내 index 계산.
-        correct_indices = []
-        for b in range(B):
-            sample_ids = batch_item_ids[b].tolist()  # list of ints (padding -1)
-            sample_correct = []
-            for x in sample_ids:
-                if x != -1:
-                    try:
-                        idx = initial_candidates.index(x)
-                        sample_correct.append(idx)
-                    except ValueError:
-                        sample_correct.append(-1)
-                else:
-                    sample_correct.append(-1)
-            correct_indices.append(sample_correct)
-        correct_indices_tensor = torch.tensor(correct_indices, dtype=torch.long, device=device)
-        print(f'Global candidate set size: {candidate_set_tensor.shape}')
+        # --- Global Candidate Mode (Tensor 기반) ---
+        # 전체 candidate set은 이미 preprocessed된 item_embeddings_tensor에서 index 0(패딩)을 제외한 모든 항목입니다.
+        # 즉, global candidate set = projection_ffn(item_embeddings_tensor[1:])
+        N = item_embeddings_tensor.shape[0]
+        global_candidate_ids = torch.arange(1, N, device=device)  # [C] (C = N-1)
+        global_base_embs = item_embeddings_tensor[global_candidate_ids]  # [C, base_dim]
+        candidate_set_tensor = projection_ffn(global_base_embs)  # [C, d]
+        
+        # 정답 index 계산:
+        # batch_item_ids: [B, L] (new index, padding=-1), 정답 index = item_id - 1
+        valid_mask = (batch_item_ids != -1)
+        correct_indices_tensor = torch.full((B, L), -1, dtype=torch.long, device=device)
+        # 에러 수정: batch_item_ids[valid_mask]를 long 형으로 변환하여 연산
+        correct_indices_tensor[valid_mask] = batch_item_ids[valid_mask].long() - 1
     return candidate_set_tensor, correct_indices_tensor
 
 
@@ -437,3 +415,108 @@ def get_batch_item_ids(item_ids, strategy):
     loss_mask = torch.tensor(padded_mask, dtype=torch.bool, device=item_ids.device)
     session_ids = torch.tensor(padded_session_ids, dtype=torch.long, device=item_ids.device)
     return selected_ids, loss_mask, session_ids
+
+
+def get_candidate_set_for_batch_tensorized(batch_item_ids, candidate_size, 
+                                             item_embeddings_t, projection_ffn, 
+                                             candidate_dict_t=None, 
+                                             global_candidate=False,
+                                             item_embeddings_dict=None):
+    """
+    Args:
+      batch_item_ids: [B, L] tensor (padding=-1)
+      candidate_size: int, Non-global 모드에서만 사용 (positive+negatives)
+      item_embeddings_t: [num_items, base_dim] tensor (GPU에 올린 아이템 임베딩)
+      projection_ffn: nn.Module, 입력: base_dim, 출력: d (최종 임베딩 차원)
+      candidate_dict_t: [num_items, candidate_size-1] tensor (Non-global 모드용)
+      global_candidate: bool, 글로벌 후보 집합 여부. 
+         - False: 출력 candidate_set_tensor는 [B, L, candidate_size, d]
+         - True:  출력 candidate_set_tensor는 [C, d] (C는 전체 후보 수, 매우 클 수 있음)
+      item_embeddings_dict: Global 모드 사용 시, 원본 item 임베딩 dictionary (키: str 혹은 int)
+                           필수 (전체 item 집합을 구성하기 위해 사용)
+    Returns:
+      candidate_set_tensor, correct_indices_tensor
+      - Non-global mode:
+          candidate_set_tensor: [B, L, candidate_size, d]
+          correct_indices_tensor: [B, L] (padding은 -1)
+      - Global mode:
+          candidate_set_tensor: [C, d]  (C: 전체 후보 수)
+          correct_indices_tensor: [B, L] (각 valid 위치는 global 후보 집합 내 positive item의 index; padding은 -1)
+    """
+    device = item_embeddings_t.device
+    B, L = batch_item_ids.shape
+
+    if not global_candidate:
+        # --- Non-Global Candidate Mode (벡터화) ---
+        valid_mask = (batch_item_ids != -1)  # [B, L]
+        valid_indices = valid_mask.nonzero(as_tuple=False)  # [N_valid, 2]
+        N_valid = valid_indices.shape[0]
+        
+        d = projection_ffn(item_embeddings_t[0:1]).shape[-1]
+        candidate_set_tensor = torch.zeros((B, L, candidate_size, d), dtype=torch.float32, device=device)
+        correct_indices_tensor = torch.full((B, L), -1, dtype=torch.long, device=device)
+        
+        if N_valid == 0:
+            return candidate_set_tensor, correct_indices_tensor
+
+        flat_item_ids = batch_item_ids[valid_mask]  # [N_valid]
+        # 각 유효 아이템에 대해, positive는 자기 자신, negatives는 candidate_dict_t lookup
+        negatives = candidate_dict_t[flat_item_ids]   # [N_valid, candidate_size - 1]
+        candidate_ids = torch.empty((N_valid, candidate_size), dtype=torch.long, device=device)
+        candidate_ids[:, 0] = flat_item_ids
+        candidate_ids[:, 1:] = negatives
+
+        base_embs = item_embeddings_t[candidate_ids]  # [N_valid, candidate_size, base_dim]
+        base_embs_flat = base_embs.view(-1, base_embs.shape[-1])  # [N_valid*candidate_size, base_dim]
+        projected_flat = projection_ffn(base_embs_flat)  # [N_valid*candidate_size, d]
+        projected = projected_flat.view(N_valid, candidate_size, -1)  # [N_valid, candidate_size, d]
+        
+        valid_correct = torch.zeros((N_valid,), dtype=torch.long, device=device)
+        candidate_set_tensor[valid_mask] = projected
+        correct_indices_tensor[valid_mask] = valid_correct
+
+        return candidate_set_tensor, correct_indices_tensor
+    else:
+        # --- Global Candidate Mode (벡터화) ---
+        if item_embeddings_dict is None:
+            raise ValueError("Global candidate 모드에서는 item_embeddings_dict가 필요합니다.")
+
+        # 1. 전체 후보 집합 구성: item_embeddings_dict의 모든 키 (또는 필요한 경우 전처리된 전체 후보 리스트)
+        # 여기서 후보 수 C는 매우 클 수 있음.
+        try:
+            all_candidate_ids = [int(key) for key in item_embeddings_dict.keys()]
+        except Exception:
+            all_candidate_ids = [key for key in item_embeddings_dict.keys()]
+        # 전체 후보 집합을 tensor로 만들기
+        candidate_ids_global = torch.tensor(all_candidate_ids, dtype=torch.long, device=device)  # [C]
+        
+        # 2. 후보 임베딩 lookup + projection
+        global_base_embs = item_embeddings_t[candidate_ids_global]  # [C, base_dim]
+        global_projected = projection_ffn(global_base_embs)  # [C, d]
+        candidate_set_tensor = global_projected  # [C, d]
+
+        # 3. 배치 내 각 valid 아이템에 대해, global 후보 집합 내에서 positive item의 인덱스 찾기.
+        #    batch_item_ids: [B, L] (padding=-1)
+        #    -> valid_mask_global: [B, L]
+        valid_mask_global = (batch_item_ids != -1)
+        # 초기 correct indices tensor: [B, L]
+        correct_indices_tensor = torch.full((B, L), -1, dtype=torch.long, device=device)
+        
+        if valid_mask_global.sum() == 0:
+            return candidate_set_tensor, correct_indices_tensor
+        
+        # 4. vectorized 방식: 
+        #    - candidate_ids_global: [C] → 확장: [1, 1, C]
+        ic = candidate_ids_global.view(1, 1, -1)
+        #    - batch_item_ids: [B, L] → 확장: [B, L, 1]
+        expanded_items = batch_item_ids.unsqueeze(-1)  # [B, L, 1]
+        # 비교: 두 tensor를 비교 -> [B, L, C] boolean tensor
+        match = (expanded_items == ic)
+        # valid한 위치에 대해, 후보가 여러 개 일 경우 첫번째 True의 index를 가져옴.
+        # argmax는 첫번째 최대값(여기서는 True가 1로 인식됨)을 반환합니다.
+        match_float = match.float()  # [B, L, C]
+        correct_idx = match_float.argmax(dim=-1)  # [B, L]
+        # 단, padding 위치는 여전히 -1로 유지
+        correct_indices_tensor[valid_mask_global] = correct_idx[valid_mask_global]
+
+        return candidate_set_tensor, correct_indices_tensor

@@ -47,7 +47,7 @@ class MultiHeadSelfAttention(nn.Module):
             all_inf = torch.isinf(scores).all(dim=-1, keepdim=True)
             scores_safe = scores.masked_fill(all_inf, 0.0)
             attn_weights = torch.softmax(scores_safe, dim=-1)
-            # 원래 모든 값이 -inf였던 row는 0으로 설정
+            attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
             attn_weights = torch.where(all_inf, torch.zeros_like(attn_weights), attn_weights)
 
             attn_weights = self.dropout(attn_weights)

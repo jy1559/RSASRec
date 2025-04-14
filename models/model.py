@@ -13,6 +13,15 @@ from tqdm.auto import tqdm
 import time
 import wandb
 
+def check_nan(tensor, name='Tensor'):
+    # tensor 내 NaN의 개수 구하기
+    nan_count = torch.isnan(tensor).sum().item()
+    total_count = tensor.numel()
+    nan_ratio = 100.0 * nan_count / total_count
+    if nan_count > 0:
+        print(f"{name}: Total elements: {total_count}, NaN elements: {nan_count} ({nan_ratio:.2f}%)")
+    return nan_count > 0
+
 class Timer:
     def __init__(self, name, wandb_logging):
         self.name = name
@@ -258,7 +267,7 @@ class SeqRecModel(nn.Module):
                  num_attention_heads=8,
                  num_add_info = 0,
                  dropout=0.2,
-                 item_embedding_dict = None,
+                 item_embedding_tensor = None,
                  hf_model_path='sentence-transformers/all-MiniLM-L6-v2',
                  device='cpu'):
         super(SeqRecModel, self).__init__()
@@ -269,7 +278,7 @@ class SeqRecModel(nn.Module):
         self.update_time_gap = update['tg']
         self.update_attention = update['attention']
         self.update_ffn = update['ffn']
-        self.item_embedding_dict = item_embedding_dict
+        self.item_embedding_tensor = item_embedding_tensor
         self.use_llm = use_llm
         self.update_user_embedding = update['user_emb']
         self.update_initial_embedding = update['init_emb']
@@ -295,7 +304,7 @@ class SeqRecModel(nn.Module):
         self.ffn = create_ffn_model(input_dim=embed_dim, hidden_dim=ffn_hidden_dim, output_dim=embed_dim)
         self.user_emb_updater = UserEmbeddingUpdater(embedding_dim=embed_dim)
 
-    def forward(self, batch, prev_user_embedding=None):
+    def forward(self, batch, prev_user_embedding=None, chunk=False):
         """
         batch: {
         'delta_ts': [B, S, I] tensor,
@@ -304,12 +313,15 @@ class SeqRecModel(nn.Module):
         'session_mask': [B, S] tensor (1 for valid, 0 for pad)
         }
         prev_user_embedding: [B, d] (없으면 updater의 initial embedding 사용)
-        
+        chunk: bool, True이면 chunking을 사용하여 배치 처리 
+            만약 True면 strategy에 따른 슬라이싱 하지 않고 raw output 그대로 출력력(default: False)
+
         이 함수는 각 세션별 입력에 대해 learnable [CLS] 토큰을 prepend하여,
         예를 들어 세션 [a, b, c, d, -1] → [[CLS], a, b, c, d, -1] 로 구성합니다.
         네트워크는 이 시퀀스를 처리하여 [B, S, I+1, d]의 출력을 내고,
         예측은 output[:, :, :-1, :] (즉, 인덱스 0 ~ I-1)을 사용하여
         각 세션의 타겟인 [a, b, c, d, -1] ([B, S, I])와 비교합니다.
+
         
         Returns:
         predictions: [B, S, I, d] tensor – 각 세션의 예측 결과
@@ -319,13 +331,13 @@ class SeqRecModel(nn.Module):
         # --- Embedding 계산 (get_embeddings는 그대로 사용) ---
         if self.use_llm:
             if self.update.get('llm', False):
-                seq_emb = get_embeddings(batch, self.use_llm, tokenizer=self.tokenizer, llm_model=self.sentence_model, item_embeddings_dict=self.item_embedding_dict)
+                seq_emb = get_embeddings(batch, self.use_llm, tokenizer=self.tokenizer, llm_model=self.sentence_model, item_embeddings_tensor=self.item_embedding_tensor)
             else:
                 with torch.no_grad():
-                    seq_emb = get_embeddings(batch, self.use_llm, tokenizer=self.tokenizer, llm_model=self.sentence_model, item_embeddings_dict=self.item_embedding_dict)
+                    seq_emb = get_embeddings(batch, self.use_llm, tokenizer=self.tokenizer, llm_model=self.sentence_model, item_embeddings_tensor=self.item_embedding_tensor)
         else:
             seq_emb = get_embeddings(batch, self.use_llm,
-                                item_embeddings_dict=self.item_embedding_dict,
+                                item_embeddings_tensor=self.item_embedding_tensor,
                                 projection_ffn=self.projection_ffn,
                                 add_info_encoder=self.add_info_ffn,
                                 timestamp_encoder=self.timestamp_encoder,
@@ -371,8 +383,7 @@ class SeqRecModel(nn.Module):
             ffn_time_gap = sess_time_gap[:, 1:, :]  # [B, I, d]
             # preprocess_inputs 함수를 이용하여 FFN 입력 준비 (user embedding 더함)
             # 여기서는 user embedding 업데이트도 진행 (원래 코드처럼)
-            cur_user_emb = prev_user_embedding if prev_user_embedding is not None else self.user_emb_updater.initial_embedding.unsqueeze(0).expand(B, -1)
-            ffn_in = preprocess_inputs(ffn_input, ffn_time_gap, cur_user_emb.unsqueeze(1), valid_mask=sess_mask[:, 1:])
+            ffn_in = preprocess_inputs(ffn_input, ffn_time_gap, user_emb_current.unsqueeze(1), valid_mask=sess_mask[:, 1:])
             ffn_out = self.ffn(ffn_in)  # [B, I, d]
             ffn_out_list.append(ffn_out.unsqueeze(1))  # [B, 1, I, d]
             # Update user embedding per session (기존 코드 그대로)
@@ -380,15 +391,18 @@ class SeqRecModel(nn.Module):
                 attn_out.unsqueeze(1),           # [B, 1, I+1, d]
                 sess_mask.unsqueeze(1),            # [B, 1, I+1]
                 batch['session_mask'][:, s].unsqueeze(-1),  # [B, 1]
-                prev_user_embedding=cur_user_emb
+                prev_user_embedding=user_emb_current
             )
         # Stack FFN 출력: [B, S, I, d]
         ffn_out_all = torch.cat(ffn_out_list, dim=1)
         # valid mask for FFN output는 원래의 interaction_mask: [B, S, I]
         valid_mask_all = batch['interaction_mask']
         
-        # 6. Flatten하여 target feature 선택 (get_batch_item_ids와 유사한 방식)
-        selected_target_features = select_target_features_flat(ffn_out_all, valid_mask_all, self.strategy)
-        # selected_target_features: [B, L, d], loss_mask: [B, L], session_ids: [B, L]
-        
-        return selected_target_features, prev_user_embedding
+        if chunk:
+            return ffn_out_all, valid_mask_all, prev_user_embedding
+        else:
+            # 6. Flatten하여 target feature 선택 (get_batch_item_ids와 유사한 방식)
+            selected_target_features = select_target_features_flat(ffn_out_all, valid_mask_all, self.strategy)
+            # selected_target_features: [B, L, d], loss_mask: [B, L], session_ids: [B, L]
+            
+            return selected_target_features, prev_user_embedding

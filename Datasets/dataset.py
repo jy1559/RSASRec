@@ -88,7 +88,7 @@ def seq_collate_fn(batch, use_llm=True):
             sess_len = len(session)
             # delta_ts, item_ids, inter_presence
             delta_ts = [0 if inter['delta_t'] is None else inter['delta_t'] for inter in session]
-            items_id = [int(inter['item_id']) for inter in session]
+            items_id = [inter['item_id'] for inter in session]
             inter_presence = [1]*sess_len
             # LLM 문장
             if use_llm:
@@ -222,7 +222,7 @@ class BucketBatchSampler(Sampler):
     
 
 def get_dataloaders(args):
-    interaction_path = os.path.join(args.dataset_folder, args.dataset_name, "interactions.json")
+    interaction_path = os.path.join(args.dataset_folder, args.dataset_name, "interactions_revised.json")
     metadata_path = os.path.join(args.dataset_folder, args.dataset_name, "item_metadata.json")
 
     dataset = SeqRecDataset(interaction_path, metadata_path, args.use_llm)
