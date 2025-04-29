@@ -12,23 +12,15 @@ echo "실험 시작..."
 
 
 # 실험 2: 기본 데이터셋(예: Globo), candidate_size 64, use_amp, accumulation_steps 4, device cuda:1
-#echo "실험 1 실행: Globo에서 train_strategy EachSession_Except_First"
-#python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_Except_First --train_batch_th 100000
+echo "실험 1 실행: Globo에서 train_strategy EachSession_Except_First"
+python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_Except_First --train_batch_th 100000
 
-echo "실험 2 실행: Globo에서 train_strategy EachSession_First_and_Last_Inter"
-python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_First_and_Last_Inter  --train_batch_th 1000000
+echo "실험 3 실행: Globo에서 test때 global_candidate 미사용"
+python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --test_global_candidate False  --train_batch_th 750000
 
-#echo "실험 3 실행: Globo에서 test때 global_candidate 미사용"
-#python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --test_global_candidate False  --train_batch_th 750000
+echo "실험 5 실행: Globo에서 train_strategy AllInter_ExceptFirst"
+python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --train_strategy AllInter_ExceptFirst  --train_batch_th 100000
 
-echo "실험 4 실행: 기본 (Globo, global_candidate, train_strategy EachSession_Except_First)"
-python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag  --train_batch_th 750000
-
-#echo "실험 5 실행: Globo에서 train_strategy AllInter_ExceptFirst"
-#python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --train_strategy AllInter_ExceptFirst  --train_batch_th 150000
-
-echo "실험 6 실행: Globo learning rate 0.01"
-python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag  --train_batch_th 750000 --lr 0.01
 
 
 # 실험 1: LFM-BeyMS 데이터셋, candidate_size 64, use_amp, accumulation_steps 4, device cuda:1

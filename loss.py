@@ -69,7 +69,6 @@ def _compute_global_rank(valid_target, candidate_set, similarity_type, chunk_siz
     N_valid = valid_target.shape[0]
     C = candidate_set.shape[0]
     rank_count = torch.zeros(N_valid, device=device, dtype=torch.long)
-    
     for start in range(0, C, chunk_size):
         end = min(C, start + chunk_size)
         chunk_candidates = candidate_set[start:end]
@@ -114,14 +113,14 @@ def compute_loss_and_metrics_global(target_features, candidate_set, correct_indi
     targets_flat = correct_indices.view(total_entries)          # [B*L]
     loss_mask_flat = loss_mask.view(total_entries).bool()         # [B*L]
     session_ids_flat = session_ids.view(total_entries)           # [B*L]
-    
+
     valid_target = target_flat[loss_mask_flat]                   # [N_valid, d]
     valid_targets = targets_flat[loss_mask_flat].long()          # [N_valid]
     valid_sessions = session_ids_flat[loss_mask_flat]            # [N_valid]
+
     N_valid = valid_target.shape[0]
     if N_valid == 0:
         return torch.tensor(0.0, device=device), {}
-    
     total_logsum, correct_logit = _compute_global_loss(valid_target, valid_targets, candidate_set, similarity_type, chunk_size)
     loss_per_sample = -(correct_logit - total_logsum)
     loss = loss_per_sample.mean()
@@ -176,7 +175,6 @@ def compute_loss_and_metrics_global(target_features, candidate_set, correct_indi
         wsra_list.append(weighted_s / sum_weights if sum_weights > 0 else 0.0)
     SRA_metric = float(np.mean(sra_list)) if len(sra_list) > 0 else 0.0
     WSRA_metric = float(np.mean(wsra_list)) if len(wsra_list) > 0 else 0.0
-
     metrics = {
         "accuracy": accuracy,
         "MRR": mrr,
@@ -326,11 +324,21 @@ def compute_loss_and_metrics(target_features, candidate_set, correct_indices,
         loss_mask_flat = loss_mask.view(-1).bool()
         valid_logits = logits_flat[loss_mask_flat]
         valid_targets = targets_flat[loss_mask_flat]
+        #print("has_inf?", torch.isinf(valid_logits).any(), "has_nan?", torch.isnan(valid_logits).any())
+        valid_logits = torch.nan_to_num(
+            valid_logits,
+            nan=0.0,
+            neginf=-1e9,
+            posinf=+1e9
+        )
         if valid_logits.shape[0] == 0:
             loss = torch.tensor(0.0, device=target_features.device)
         else:
             loss = F.cross_entropy(valid_logits, valid_targets)
         metrics = compute_seqrec_metrics(logits_flat, targets_flat, session_ids.view(-1), loss_mask_flat, k=k, chunk_size=chunk_size)
+        #if check_nan(loss):
+        #    print("NaN detected in loss")
+        #print(f"loss: {loss}")
         return loss, metrics
     else:
         return compute_loss_and_metrics_global(target_features, candidate_set, correct_indices, loss_mask, session_ids, similarity_type, k, chunk_size)

@@ -29,21 +29,22 @@ def parse_args():
     parser.add_argument("--train_batch_size", type=int, default=4)
     parser.add_argument("--val_batch_size", type=int, default=4)
     parser.add_argument("--test_batch_size", type=int, default=4)
-    parser.add_argument("--train_batch_th", type=int, default=300000)
-    parser.add_argument("--val_batch_th", type=int, default=500000)
-    parser.add_argument("--test_batch_th", type=int, default=500000)
+    parser.add_argument("--train_batch_th", type=int, default=70000)
+    parser.add_argument("--val_batch_th", type=int, default=1000000)
+    parser.add_argument("--test_batch_th", type=int, default=1000000)
     parser.add_argument("--train_ratio", type=float, default=0.8)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--num_epochs", type=int, default=10)
     parser.add_argument("--use_llm", type=bool, default=False)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--use_bucket_batching", type=bool, default=True)
     parser.add_argument("--optimizer", type=str, default="AdamW")
     parser.add_argument("--train_strategy", type=str, default="EachSession_LastInter")
     parser.add_argument("--test_strategy", type=str, default="Global_LastInter")
-    parser.add_argument("--candidate_size", type=int, default=32, help="Candidate set 크기 (positive + negatives)")
+    parser.add_argument("--candidate_size", type=int, default=64, help="Candidate set 크기 (positive + negatives)")
     parser.add_argument("--global_candidate", action='store_true', help="글로벌 candidate set 사용 여부")
+    parser.add_argument("--test_global_candidate", type=bool, default=True, help="val/test에서의 글로벌 candidate set 사용 여부")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use, e.g., 'cuda:0', 'cuda:1', etc.")
     parser.add_argument("--wandb_off", action="store_true", help="Turn off wandb logging")
     parser.add_argument("--use_amp", action="store_true", help="Turn on FP16 training")
@@ -92,19 +93,18 @@ def select_target_features_flat_chunk(chunk_raw_output, valid_mask_all, strategy
         elif strategy == "AllInter_ExceptFirst":
             flat_valid = valid_mask_all[b].view(-1)
             valid_idx = (flat_valid == True).nonzero(as_tuple=False).squeeze(-1)
-            if valid_idx.numel() > 1:
-                for idx in valid_idx[1:]:
+
+            if chunk_position == "first" and valid_idx.numel() > 1:
+                use_idxs = valid_idx[1:]
+            else:
+                use_idxs = valid_idx       # 이후 청크는 전부 선택
+            
+            for idx in use_idxs:
                     idx = idx.item()
-                    s_idx = idx // I
+                    s_idx     = idx // I
                     token_idx = idx % I
                     selected_b.append(chunk_raw_output[b, s_idx, token_idx, :])
                     sess_ids_b.append(s_idx)
-            elif valid_idx.numel() == 1:
-                idx = valid_idx.item()
-                s_idx = idx // I
-                token_idx = idx % I
-                selected_b.append(chunk_raw_output[b, s_idx, token_idx, :])
-                sess_ids_b.append(s_idx)
         else:
             # 기본적으로 EachSession_LastInter 처리
             for s in range(S_chunk):
@@ -190,7 +190,23 @@ def select_targets_and_candidates_chunk(chunk_raw_output, valid_mask_all,
     # 2. Candidate set extraction
     if global_candidate:
         candidate_chunk = full_candidate_set
-        candidate_correct = full_correct_indices
+        corr_list = []
+        for b in range(full_correct_indices.size(0)):
+            # 세션 범위 & loss_mask 둘 다 만족하는 위치만 취함
+            mask = ((full_session_ids[b] >= s_start) &
+                    (full_session_ids[b] <  s_end)  &
+                     full_loss_mask[b])              # [L_full] bool
+            corr_list.append(full_correct_indices[b, mask])  # [L_chunk_b]
+
+        # 배치마다 길이가 다르므로 padding
+        L_chunk = selected_output.shape[1]           # 패딩 목표 길이
+        for i, t in enumerate(corr_list):
+            if t.numel() < L_chunk:
+                pad = torch.full((L_chunk - t.numel(),),
+                                 -1, dtype=torch.long,
+                                 device=full_correct_indices.device)
+                corr_list[i] = torch.cat([t, pad], dim=0)
+        candidate_correct = torch.stack(corr_list, dim=0)      # [B, L_chunk]
     else:
         # full_candidate_set: [B, S, candidate_size, d]; full_correct_indices: [B, S]
         B_local = full_candidate_set.shape[0]
@@ -234,7 +250,7 @@ def batch_by_chunk(batch, full_candidate_set, full_correct_indices, full_loss_ma
     if batch_th <= 0:
         num_chunks = 1
     else:
-        num_chunks = int(total_interactions // batch_th) + 5
+        num_chunks = int((total_interactions * 2) // batch_th) + 3
         num_chunks = min(num_chunks, S)
     
     # 세션 분할 경계 계산
@@ -262,7 +278,6 @@ def batch_by_chunk(batch, full_candidate_set, full_correct_indices, full_loss_ma
         "NDCG@10": 0.0,
     }
     prev_user_embedding = None
-
     for chunk_idx, (s_start, s_end) in enumerate(chunk_boundaries):
         current_batch_counter = base_batch_counter + chunk_idx
 
@@ -295,7 +310,12 @@ def batch_by_chunk(batch, full_candidate_set, full_correct_indices, full_loss_ma
         
         if selected_output is None:
             continue
-
+        """if global_candidate:
+            print(f"full_correct_indices shape: {full_correct_indices.shape}")
+            print(f"seleted_output shape: {selected_output.shape}")
+            print(f"selected_loss_mask shape: {selected_loss_mask.shape}")
+            print(f"candidate_chunk shape: {candidate_chunk.shape}")
+            print(f"candidate_correct shape: {candidate_correct.shape}")"""
         loss_chunk, metrics_chunk = compute_loss_and_metrics(
             selected_output, candidate_chunk, candidate_correct,
             strategy=strategy, global_candidate=global_candidate,
@@ -332,6 +352,9 @@ def train_one_epoch(model, accumulated_step, dataloader, optimizer, device,
                     candidate_size, global_candidate, item_embeddings_tensor, 
                     candidate_tensor, wandb_logging, train_strategy='EachSession_LastInter',
                     accumulation_steps=1, scaler=None, batch_th = 50000):
+    """for name, p in model.named_parameters():
+        if not p.requires_grad:
+            print(f"'{name}' has requires_grad=False")"""
     model.train()
     model.strategy = train_strategy
     total_loss = 0.0
@@ -348,15 +371,17 @@ def train_one_epoch(model, accumulated_step, dataloader, optimizer, device,
         if wandb_logging:
             wandb.log({
                 "Batch_size/batch_total_size": batch['item_id'].shape[0] * batch['item_id'].shape[1] * batch['item_id'].shape[2],
+                "Batch_size/user_total_size": batch['item_id'].shape[1] * batch['item_id'].shape[2],
                 "Batch_size/num_user": batch['item_id'].shape[0],
                 "Batch_size/max_sessions": batch['item_id'].shape[1],
                 "Batch_size/max_interactions": batch['item_id'].shape[2],
                 "Batch_size/attention_overhead": batch['item_id'].shape[0] * batch['item_id'].shape[1] * batch['item_id'].shape[2] * batch['item_id'].shape[2],
             }, step=batch_counter)
-        # 판단: 배치 내 총 interaction 수가 threshold의 1.25배 이상이면 chunk 방식 실행
+        # 판단: 배치 내 총 interaction 수가 threshold의 1.1배 이상이면 chunk 방식 실행
+        batch_size = batch['item_id'].shape[0]
         session_size = batch['item_id'].shape[1]
         interaction_size = batch['item_id'].shape[2]
-        use_chunk = (session_size * interaction_size > 1.25 *  batch_th)
+        use_chunk = (session_size * interaction_size > 0.4 *  batch_th) or (interaction_size > 1000)
         if use_chunk:
             # 미리 candidate 및 loss 관련 정보를 full batch로 계산
             with Timer("get_batch_item_ids", wandb_logging, batch_counter):
@@ -415,12 +440,21 @@ def train_one_epoch(model, accumulated_step, dataloader, optimizer, device,
             loss = loss / accumulation_steps
             with Timer("backward", wandb_logging, batch_counter):
                 if scaler is not None:
-                    scaler.scale(loss).backward()
+                        scaler.scale(loss).backward()
                 else:
-                    loss.backward()
+                        loss.backward()
             loss_value = loss.item() * accumulation_steps
         loss_accum_cpu += loss_value
         total_loss += loss_value
+        """total_grad_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                total_grad_norm += p.grad.detach().abs().sum().item()
+        print()
+        print("lr:", optimizer.param_groups[0]['lr'])
+        print("total grad abs sum:", total_grad_norm)
+        param = next(model.parameters())
+        before = param.detach().clone()"""
         if batch_counter % accumulation_steps == 0:
             with Timer("optimizer_step", wandb_logging, batch_counter):
                 if scaler is not None:
@@ -430,6 +464,8 @@ def train_one_epoch(model, accumulated_step, dataloader, optimizer, device,
                     optimizer.step()
                 optimizer.zero_grad()
             loss_accum_cpu = 0.0
+        #after = param.detach()
+        #print("max |Δparam|:", (before - after).abs().max().item())
         if wandb_logging:
             wandb.log({
                 "train/loss": loss_value / accumulation_steps,
@@ -464,7 +500,7 @@ def evaluate(model, dataloader, device, item_embeddings_tensor, candidate_size, 
             batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
             session_size = batch['item_id'].shape[1]
             interaction_size = batch['item_id'].shape[2]
-            use_chunk = (session_size * interaction_size > 2.5 * batch_th)
+            use_chunk = (session_size * interaction_size > 0.4 * batch_th) or (interaction_size > 1000)
             if use_chunk:
                 full_batch_item_ids, full_loss_mask, full_session_ids = get_batch_item_ids(batch['item_id'], strategy=loss_strategy)
                 full_candidate_set, full_correct_indices = get_candidate_set_for_batch(
@@ -509,7 +545,8 @@ def main():
     device = args.device
     if not args.wandb_off:
         wandb.init(project="RSASRec_25April", config=vars(args))
-        wandb.define_metric("val/*", step_metric="val_epoch")
+        wandb.define_metric("val_epoch")
+        wandb.define_metric("val*", step_metric="val_epoch")
     # 데이터셋 로더 생성
     sc = time()
     train_loader, val_loader, test_loader = get_dataloaders(args)
@@ -572,7 +609,7 @@ def main():
             item_embeddings_tensor,
             candidate_size=args.candidate_size,
             candidate_tensor=candidate_tensor,
-            global_candidate=True,
+            global_candidate=args.test_global_candidate,
             loss_strategy=args.test_strategy,
             batch_th = args.val_batch_th
         )
@@ -581,26 +618,68 @@ def main():
                          WSRA=f'{metrics["WSRA"]*100:.2f}%')
         if not args.wandb_off:
             wandb.log({"train/epoch": epoch}, step=accumulated_step)
-            wandb.log({
-                "val_epoch": epoch,
-                "val/loss": val_loss,
-                "val/accuracy": metrics["accuracy"],
-                "val/MRR": metrics["MRR"],
-                "val/HitRate@1": metrics["HitRate@1"],
-                "val/NDCG@1": metrics["NDCG@1"],
-                "val/HitRate@3": metrics["HitRate@3"],
-                "val/NDCG@3": metrics["NDCG@3"],
-                "val/HitRate@5": metrics["HitRate@5"],
-                "val/NDCG@5": metrics["NDCG@5"],
-                "val/HitRate@10": metrics["HitRate@10"],
-                "val/NDCG@10": metrics["NDCG@10"],
-                "val/SRA": metrics["SRA"],
-                "val/WSRA": metrics["WSRA"]
-            })
-        checkpoint_dir = "checkpoints"
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        checkpoint_path = os.path.join(checkpoint_dir, f"model_epoch_{epoch}.pt")
-        torch.save(model.state_dict(), checkpoint_path)
+            if args.test_strategy != "Global_LastInter":
+                gval_loss, gmetrics = evaluate(
+                    model,
+                    val_loader,
+                    device,
+                    item_embeddings_tensor,
+                    candidate_size=args.candidate_size,
+                    candidate_tensor=candidate_tensor,
+                    global_candidate=args.test_global_candidate,
+                    loss_strategy='Global_LastInter',
+                    batch_th = args.val_batch_th
+                )
+                wandb.log({
+                    f"val_epoch": epoch,
+                    f"val({args.test_strategy})/loss": val_loss,
+                    f"val({args.test_strategy})/accuracy": metrics["accuracy"],
+                    f"val({args.test_strategy})/MRR": metrics["MRR"],
+                    f"val({args.test_strategy})/HitRate@1": metrics["HitRate@1"],
+                    f"val({args.test_strategy})/NDCG@1": metrics["NDCG@1"],
+                    f"val({args.test_strategy})/HitRate@3": metrics["HitRate@3"],
+                    f"val({args.test_strategy})/NDCG@3": metrics["NDCG@3"],
+                    f"val({args.test_strategy})/HitRate@5": metrics["HitRate@5"],
+                    f"val({args.test_strategy})/NDCG@5": metrics["NDCG@5"],
+                    f"val({args.test_strategy})/HitRate@10": metrics["HitRate@10"],
+                    f"val({args.test_strategy})/NDCG@10": metrics["NDCG@10"],
+                    f"val({args.test_strategy})/SRA": metrics["SRA"],
+                    f"val({args.test_strategy})/WSRA": metrics["WSRA"],
+                    "val(Global_LastInter)/loss": gval_loss,
+                    "val(Global_LastInter)/accuracy": gmetrics["accuracy"],
+                    "val(Global_LastInter)/MRR": gmetrics["MRR"],
+                    "val(Global_LastInter)/HitRate@1": gmetrics["HitRate@1"],
+                    "val(Global_LastInter)/NDCG@1": gmetrics["NDCG@1"],
+                    "val(Global_LastInter)/HitRate@3": gmetrics["HitRate@3"],
+                    "val(Global_LastInter)/NDCG@3": gmetrics["NDCG@3"],
+                    "val(Global_LastInter)/HitRate@5": gmetrics["HitRate@5"],
+                    "val(Global_LastInter)/NDCG@5": gmetrics["NDCG@5"],
+                    "val(Global_LastInter)/HitRate@10":gmetrics["HitRate@10"],
+                    "val(Global_LastInter)/NDCG@10": gmetrics["NDCG@10"],
+                    "val(Global_LastInter)/SRA": gmetrics["SRA"],
+                    "val(Global_LastInter)/WSRA": gmetrics["WSRA"]
+                })
+            else:
+                wandb.log({
+                    f"val_epoch": epoch,
+                    f"val({args.test_strategy})/loss": val_loss,
+                    f"val({args.test_strategy})/accuracy": metrics["accuracy"],
+                    f"val({args.test_strategy})/MRR": metrics["MRR"],
+                    f"val({args.test_strategy})/HitRate@1": metrics["HitRate@1"],
+                    f"val({args.test_strategy})/NDCG@1": metrics["NDCG@1"],
+                    f"val({args.test_strategy})/HitRate@3": metrics["HitRate@3"],
+                    f"val({args.test_strategy})/NDCG@3": metrics["NDCG@3"],
+                    f"val({args.test_strategy})/HitRate@5": metrics["HitRate@5"],
+                    f"val({args.test_strategy})/NDCG@5": metrics["NDCG@5"],
+                    f"val({args.test_strategy})/HitRate@10": metrics["HitRate@10"],
+                    f"val({args.test_strategy})/NDCG@10": metrics["NDCG@10"],
+                    f"val({args.test_strategy})/SRA": metrics["SRA"],
+                    f"val({args.test_strategy})/WSRA": metrics["WSRA"]
+                })
+        #checkpoint_dir = "checkpoints"
+        #os.makedirs(checkpoint_dir, exist_ok=True)
+        #checkpoint_path = os.path.join(checkpoint_dir, f"model_epoch_{epoch}.pt")
+        #torch.save(model.state_dict(), checkpoint_path)
     
     test_loss, test_metrics = evaluate(
         model,
@@ -609,25 +688,52 @@ def main():
         item_embeddings_tensor,
         candidate_size=args.candidate_size,
         candidate_tensor=candidate_tensor,
-        global_candidate=True,
+        global_candidate=args.test_global_candidate,
         loss_strategy=args.test_strategy
     )
     if not args.wandb_off:
         wandb.log({
-            "test/loss": test_loss,
-            "test/accuracy": test_metrics["accuracy"],
-            "test/MRR": test_metrics["MRR"],
-            "test/HitRate@1": test_metrics["HitRate@1"],
-            "test/NDCG@1": test_metrics["NDCG@1"],
-            "test/HitRate@3": test_metrics["HitRate@3"],
-            "test/NDCG@3": test_metrics["NDCG@3"],
-            "test/HitRate@5": test_metrics["HitRate@5"],
-            "test/NDCG@5": test_metrics["NDCG@5"],
-            "test/HitRate@10": test_metrics["HitRate@10"],
-            "test/NDCG@10": test_metrics["NDCG@10"],
-            "test/SRA": test_metrics["SRA"],
-            "test/WSRA": test_metrics["WSRA"]
+            f"test({args.test_strategy})/loss": test_loss,
+            f"test({args.test_strategy})/accuracy": test_metrics["accuracy"],
+            f"test({args.test_strategy})/MRR": test_metrics["MRR"],
+            f"test({args.test_strategy})/HitRate@1": test_metrics["HitRate@1"],
+            f"test({args.test_strategy})/NDCG@1": test_metrics["NDCG@1"],
+            f"test({args.test_strategy})/HitRate@3": test_metrics["HitRate@3"],
+            f"test({args.test_strategy})/NDCG@3": test_metrics["NDCG@3"],
+            f"test({args.test_strategy})/HitRate@5": test_metrics["HitRate@5"],
+            f"test({args.test_strategy})/NDCG@5": test_metrics["NDCG@5"],
+            f"test({args.test_strategy})/HitRate@10": test_metrics["HitRate@10"],
+            f"test({args.test_strategy})/NDCG@10": test_metrics["NDCG@10"],
+            f"test({args.test_strategy})/SRA": test_metrics["SRA"],
+            f"test({args.test_strategy})/WSRA": test_metrics["WSRA"]
         })
+    if args.test_strategy != 'Global_LastInter':
+        test_loss, test_metrics = evaluate(
+            model,
+            test_loader,
+            device,
+            item_embeddings_tensor,
+            candidate_size=args.candidate_size,
+            candidate_tensor=candidate_tensor,
+            global_candidate=True,
+            loss_strategy="Global_LastInter"
+        )
+        if not args.wandb_off:
+            wandb.log({
+                f"test(Global_LastInter)/loss": test_loss,
+                f"test(Global_LastInter)/accuracy": test_metrics["accuracy"],
+                f"test(Global_LastInter)/MRR": test_metrics["MRR"],
+                f"test(Global_LastInter)/HitRate@1": test_metrics["HitRate@1"],
+                f"test(Global_LastInter)/NDCG@1": test_metrics["NDCG@1"],
+                f"test(Global_LastInter)/HitRate@3": test_metrics["HitRate@3"],
+                f"test(Global_LastInter)/NDCG@3": test_metrics["NDCG@3"],
+                f"test(Global_LastInter)/HitRate@5": test_metrics["HitRate@5"],
+                f"test(Global_LastInter)/NDCG@5": test_metrics["NDCG@5"],
+                f"test(Global_LastInter)/HitRate@10": test_metrics["HitRate@10"],
+                f"test(Global_LastInter)/NDCG@10": test_metrics["NDCG@10"],
+                f"test(Global_LastInter)/SRA": test_metrics["SRA"],
+                f"test(Global_LastInter)/WSRA": test_metrics["WSRA"]
+            })
     print(f"Test Loss = {test_loss:.4f}")
 
 if __name__ == "__main__":

@@ -518,5 +518,7 @@ def get_candidate_set_for_batch_tensorized(batch_item_ids, candidate_size,
         correct_idx = match_float.argmax(dim=-1)  # [B, L]
         # 단, padding 위치는 여전히 -1로 유지
         correct_indices_tensor[valid_mask_global] = correct_idx[valid_mask_global]
-
+        print(f"candidate_set_tensor.shape: {candidate_set_tensor.shape}, correct_indices_tensor.shape: {correct_indices_tensor.shape}")
+        print(f"candidate_set_tensor.example: {candidate_set_tensor[0]}")
+        print(f"correct_indices_tensor.example: {correct_indices_tensor[0]}")
         return candidate_set_tensor, correct_indices_tensor

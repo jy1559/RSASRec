@@ -38,18 +38,19 @@ class MultiHeadSelfAttention(nn.Module):
             scores = torch.matmul(Q, K.transpose(-2, -1)) / (embed_dim ** 0.5)
 
             causal_mask = torch.tril(torch.ones((max_inter, max_inter), device=x.device)).bool().unsqueeze(0)
-            scores = scores.masked_fill(~causal_mask, float('-inf'))
+            scores = scores.masked_fill(~causal_mask, -1e4)
 
             padding_mask = mask.unsqueeze(1)
-            scores = scores.masked_fill(padding_mask == 0, float('-inf'))
+            scores = scores.masked_fill(padding_mask == 0, -1e4)
 
             # 만약 해당 row의 모든 값이 -inf라면, softmax 계산 전에 임시로 0으로 변경
-            all_inf = torch.isinf(scores).all(dim=-1, keepdim=True)
-            scores_safe = scores.masked_fill(all_inf, 0.0)
-            attn_weights = torch.softmax(scores_safe, dim=-1)
-            attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
-            attn_weights = torch.where(all_inf, torch.zeros_like(attn_weights), attn_weights)
-
+            scores = torch.nan_to_num(
+                scores,
+                nan=0.0,
+                neginf=-1e4,
+                posinf=+1e4
+            )
+            attn_weights = torch.softmax(scores, dim=-1)
             attn_weights = self.dropout(attn_weights)
             head_output = torch.matmul(attn_weights, V)
             head_outputs.append(head_output)

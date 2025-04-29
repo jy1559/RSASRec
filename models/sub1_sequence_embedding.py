@@ -236,9 +236,9 @@ def get_item_embeddings(item_ids, add_info, timestamps, item_embeddings_tensor,
     base_embs = item_embeddings_tensor[indices_tensor]  # [B, S, I, base_dim]
 
     # --- 2. Timestamp 인코딩 (벡터화) ---
-    ts_flat = timestamps.view(-1, 1)         # [B*S*I, 1]
+    ts_flat = timestamps.reshape(-1, 1)         # [B*S*I, 1]
     ts_enc_flat = timestamp_encoder(ts_flat) # [B*S*I, base_dim]
-    ts_enc = ts_enc_flat.view(B, S, I, -1)     # [B, S, I, base_dim]
+    ts_enc = ts_enc_flat.reshape(B, S, I, -1)     # [B, S, I, base_dim]
 
     # --- 3. Add_info 인코딩 (리스트를 tensor로 변환) ---
     num_add_info = len(add_info_encoders)
