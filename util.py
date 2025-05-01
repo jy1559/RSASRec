@@ -6,7 +6,7 @@ import torch
 from tqdm.auto import tqdm
 import torch.nn.functional as F
 import numpy as np
-from models.sub1_sequence_embedding import sentence_embedder, mean_pooling
+from models.Part1_Embedding import sentence_embedder, mean_pooling
 import time
 import wandb
 

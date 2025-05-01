@@ -2,11 +2,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .sub1_sequence_embedding import sentence_embedder, get_embeddings, AddInfoEncoder, TimestampEncoder, ProjectionFFN
-from .sub2_time_gap import TimeGapEmbedding
-from .sub3_attention import MultiHeadSelfAttention
-from .sub4_user_embedding import UserEmbeddingUpdater
-from .sub5_FFN import preprocess_inputs, create_ffn_model
+from .Part1_Embedding import sentence_embedder, get_embeddings, AddInfoEncoder, TimestampEncoder, ProjectionFFN, TimeGapEmbedding
+from .Part2_Session import MultiHeadSelfAttention, preprocess_inputs, create_ffn_model
+from .Part3_UserEmbbeding import UserEmbeddingUpdater
 
 from time import time
 from tqdm.auto import tqdm
