@@ -210,7 +210,6 @@ def compute_seqrec_metrics(logits_flat, targets_flat, session_ids, valid_mask, k
     valid_logits = logits_flat[valid_mask]
     valid_targets = targets_flat[valid_mask]
     valid_session_ids = session_ids[valid_mask]
-    
     pos_in_session = torch.zeros(valid_session_ids.shape, device=device, dtype=torch.long)
     sess_counter = defaultdict(int)
     for i, s_id in enumerate(valid_session_ids.tolist()):
@@ -339,6 +338,6 @@ def compute_loss_and_metrics(target_features, candidate_set, correct_indices,
         #if check_nan(loss):
         #    print("NaN detected in loss")
         #print(f"loss: {loss}")
-        return loss, metrics
+        return loss, metrics, int(loss_mask.sum().item())
     else:
         return compute_loss_and_metrics_global(target_features, candidate_set, correct_indices, loss_mask, session_ids, similarity_type, k, chunk_size)

@@ -5,6 +5,7 @@ import os
 from time import time
 import argparse
 from torch.amp import autocast, GradScaler
+from collections import defaultdict
 from contextlib import nullcontext
 import wandb
 from tqdm.auto import tqdm
@@ -43,11 +44,11 @@ def parse_args():
     parser.add_argument("--test_strategy", type=str, default="Global_LastInter")
     parser.add_argument("--candidate_size", type=int, default=64, help="Candidate set 크기 (positive + negatives)")
     parser.add_argument("--global_candidate", action='store_true', help="글로벌 candidate set 사용 여부")
-    parser.add_argument("--test_global_candidate", type=bool, default=True, help="val/test에서의 글로벌 candidate set 사용 여부")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use, e.g., 'cuda:0', 'cuda:1', etc.")
     parser.add_argument("--wandb_off", action="store_true", help="Turn off wandb logging")
     parser.add_argument("--use_amp", action="store_true", help="Turn on FP16 training")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--projection_before_summation", type=bool, default=True, help="Embedding 만들 때 add_info랑 time gap을 384로 더한 후 projection할지")
     return parser.parse_args()
 
 
@@ -55,7 +56,7 @@ def parse_args():
 def train_one_epoch(model, accumulated_step, dataloader, optimizer, device, 
                     candidate_size, global_candidate, item_embeddings_tensor, 
                     candidate_tensor, wandb_logging, train_strategy='EachSession_LastInter',
-                    accumulation_steps=1, scaler=None, batch_th = 50000):
+                    accumulation_steps=1, epoch_num = 0, scaler=None, batch_th = 50000):
     """for name, p in model.named_parameters():
         if not p.requires_grad:
             print(f"'{name}' has requires_grad=False")"""
@@ -63,6 +64,7 @@ def train_one_epoch(model, accumulated_step, dataloader, optimizer, device,
     model.strategy = train_strategy
     total_loss = 0.0
     batch_counter = accumulated_step
+    total_batches = len(dataloader)
     pbar = tqdm(dataloader, desc="epoch", leave=False, total=len(dataloader))
     loss_accum_cpu = 0.0  
     optimizer.zero_grad()
@@ -134,14 +136,13 @@ def train_one_epoch(model, accumulated_step, dataloader, optimizer, device,
             candidate_set = candidate_set.to(device)
             correct_indices = correct_indices.to(device)
             with Timer("compute_loss_and_metrics", wandb_logging, batch_counter):
-                loss, metric = compute_loss_and_metrics(
+                loss, metric, _ = compute_loss_and_metrics(
                     output_features, candidate_set, correct_indices,
                     strategy=train_strategy,
                     global_candidate=global_candidate,
                     loss_mask=loss_mask,
                     session_ids=session_ids
                 )
-            loss = loss / accumulation_steps
             with Timer("backward", wandb_logging, batch_counter):
                 if scaler is not None:
                         scaler.scale(loss).backward()
@@ -162,7 +163,11 @@ def train_one_epoch(model, accumulated_step, dataloader, optimizer, device,
         #after = param.detach()
         #print("max |Δparam|:", (before - after).abs().max().item())
         if wandb_logging:
-            log_dict = {"train/loss": loss_value / accumulation_steps}
+            log_bucket = 200
+            progress = (batch_counter / total_batches)
+            progress = int(round(progress * log_bucket)) / log_bucket
+            log_dict = {"epoch_progress": progress,
+                        "train/loss": loss_value / accumulation_steps}
             for k in metric.keys():
                 val = metric[k].item() if torch.is_tensor(metric[k]) else metric[k]
                 log_dict[f"train/{k}"] = val
@@ -180,8 +185,11 @@ def evaluate(model, dataloader, device, item_embeddings_tensor, candidate_size, 
     model.strategy = loss_strategy
     total_loss = 0.0
     metrics = {}
+    metric_sum = defaultdict(float)
+    valid_total = 0
+
     with torch.no_grad():
-        for batch in dataloader:
+        for batch in tqdm(dataloader, desc="val", leave=False, total=len(dataloader)):
             batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
             session_size = batch['item_id'].shape[1]
             interaction_size = batch['item_id'].shape[2]
@@ -215,7 +223,7 @@ def evaluate(model, dataloader, device, item_embeddings_tensor, candidate_size, 
                 )
                 candidate_set = candidate_set.to(device)
                 correct_indices = correct_indices.to(device)
-                loss, metrics = compute_loss_and_metrics(
+                loss, metrics, valid_cnt = compute_loss_and_metrics(
                     output_features, candidate_set, correct_indices,
                     strategy=loss_strategy,
                     global_candidate=global_candidate,
@@ -223,13 +231,19 @@ def evaluate(model, dataloader, device, item_embeddings_tensor, candidate_size, 
                     session_ids=session_ids
                 )
                 total_loss += loss.item()
-    return total_loss / len(dataloader), metrics
+                for k, v in metrics.items():
+                    metric_sum[k]   += v * valid_cnt    # 가중 합
+                valid_total  += valid_cnt        # 가중치 누적
+    epoch_metrics = {k: metric_sum[k] / valid_total for k in metric_sum}
+    return total_loss / len(dataloader), epoch_metrics
 
 def main():
     args = parse_args()
     device = args.device
     if not args.wandb_off:
         wandb.init(project="RSASRec_25April", config=vars(args))
+        wandb.define_metric("epoch_progress")
+        wandb.define_metric("train/*", step_metric="epoch_progress", overwrite=True)
         wandb.define_metric("val_epoch")
         wandb.define_metric("val*", step_metric="val_epoch")
         metric_names = [
@@ -256,7 +270,10 @@ def main():
     elif args.dataset_name == "LFM-BeyMS": num_add_info = 0
     elif args.dataset_name == "Retail_Rocket": num_add_info = 2
     
-    model = SeqRecModel(num_add_info=num_add_info, item_embedding_tensor=item_embeddings_tensor if not args.use_llm else None, device=device)
+    model = SeqRecModel(num_add_info=num_add_info, 
+                        item_embedding_tensor=item_embeddings_tensor if not args.use_llm else None, 
+                        device=device,
+                        projection_before_summation = args.projection_before_summation)
     model.to(device)
     use_amp = args.use_amp
     accumulation_steps = args.accumulation_steps
@@ -285,51 +302,41 @@ def main():
             wandb_logging=not args.wandb_off,
             train_strategy=args.train_strategy,
             accumulation_steps=accumulation_steps,
+            epoch_num=epoch,
             scaler=scaler,
             batch_th=args.train_batch_th
         )
-        val_loss, metrics = evaluate(
-            model,
-            val_loader,
-            device,
-            item_embeddings_tensor,
-            candidate_size=args.candidate_size,
-            candidate_tensor=candidate_tensor,
-            global_candidate=args.test_global_candidate,
-            loss_strategy=args.test_strategy,
-            batch_th = args.val_batch_th
-        )
-        pbar.set_postfix(acc=f'{metrics["accuracy"]*100:.2f}%', train_loss=f'{train_loss:.4f}',val_loss = f'{val_loss:.4f}',
-                         HR_5=f'{metrics["HitRate@5"]*100:.2f}%', MRR=f'{metrics["MRR"]*100:.2f}%', NDCG3=f'{metrics["NDCG@3"]*100:.2f}%',
-                         WSRA=f'{metrics["WSRA"]*100:.2f}%')
         if not args.wandb_off:
-            wandb.log({"train/epoch": epoch}, step=accumulated_step)
-            if args.test_strategy != "Global_LastInter":
-                gval_loss, gmetrics = evaluate(
-                    model,
-                    val_loader,
-                    device,
-                    item_embeddings_tensor,
-                    candidate_size=args.candidate_size,
-                    candidate_tensor=candidate_tensor,
-                    global_candidate=args.test_global_candidate,
-                    loss_strategy='Global_LastInter',
-                    batch_th = args.val_batch_th
-                )
-                log_dict = {f"val_epoch": epoch, f"val({args.test_strategy})": val_loss, "val(Global_LastInter)/loss": gval_loss}
-                for k in metrics.keys():
-                    val = metrics[k].item() if torch.is_tensor(metrics[k]) else metrics[k]          # tensor → float
-                    log_dict[f"val({args.test_strategy})/{k}"] = val
-                    val = gmetrics[k].item() if torch.is_tensor(gmetrics[k]) else gmetrics[k]          # tensor → float
-                    log_dict[f"val(Global_LastInter)/{k}"] = val
+            # 0) 공통 메타
+            log_dict = {"val_epoch": epoch}
 
-                wandb.log(log_dict)
-            else:
-                log_dict = {f"val_epoch": epoch, f"val({args.test_strategy})": val_loss}
-                for k in metrics.keys():
-                    val = metrics[k].item() if torch.is_tensor(metrics[k]) else metrics[k]          # tensor → float
-                    log_dict[f"val({args.test_strategy})/{k}"] = val
-                wandb.log(log_dict)
+            # 2) 주 실험 strategy: args.test_strategy
+            strategies = [args.test_strategy] \
+                        if args.test_strategy == "Global_LastInter" else \
+                        [args.test_strategy, "Global_LastInter"]          # 필요시 확장 가능
+            #  ──  Local / Global 두 번 돌림 ──────────────────────────
+            for strat in strategies:
+                for gc_flag in [False]:          # Global, Local
+                    loss, metrics = evaluate(
+                        model, val_loader, device,
+                        item_embeddings_tensor,
+                        candidate_size=args.candidate_size,
+                        candidate_tensor=candidate_tensor,
+                        global_candidate=gc_flag,
+                        loss_strategy=strat,
+                        batch_th=args.val_batch_th
+                    )
+                    cand_tag = "Global_candidate" if gc_flag else "Local_candidate"
+                    head = f"val({strat})_{cand_tag}"
+                    log_dict[f"{head}/loss"] = loss
+                    for k, v in metrics.items():
+                        log_dict[f"{head}/{k}"] = float(v)
+
+            # 3) WANDB 업로드 (step=None → wandb 내부 step, x축은 val_epoch로 정의해 둠)
+            wandb.log(log_dict)
+            pbar.set_postfix(acc=f'{metrics["accuracy"]*100:.2f}%', train_loss=f'{train_loss:.4f}',val_loss = f'{loss:.4f}',
+                            HR_5=f'{metrics["HitRate@5"]*100:.2f}%', MRR=f'{metrics["MRR"]*100:.2f}%', NDCG3=f'{metrics["NDCG@3"]*100:.2f}%',
+                            WSRA=f'{metrics["WSRA"]*100:.2f}%')
         #checkpoint_dir = "checkpoints"
         #os.makedirs(checkpoint_dir, exist_ok=True)
         #checkpoint_path = os.path.join(checkpoint_dir, f"model_epoch_{epoch}.pt"
@@ -342,7 +349,7 @@ def main():
         item_embeddings_tensor,
         candidate_size=args.candidate_size,
         candidate_tensor=candidate_tensor,
-        global_candidate=args.test_global_candidate,
+        global_candidate=False,
         loss_strategy=args.test_strategy
     )
     log_dict = {f"test({args.test_strategy})": test_loss}
@@ -359,7 +366,7 @@ def main():
                 item_embeddings_tensor,
                 candidate_size=args.candidate_size,
                 candidate_tensor=candidate_tensor,
-                global_candidate=True,
+                global_candidate=False,
                 loss_strategy="Global_LastInter"
             )
             log_dict[f"test(Global_LastInter)"] = test_loss

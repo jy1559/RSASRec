@@ -248,7 +248,7 @@ def get_item_embeddings_old(item_ids, add_info, timestamps, item_embeddings_dict
 
 
 def get_item_embeddings(item_ids, add_info, timestamps, item_embeddings_tensor,
-                        projection_ffn, timestamp_encoder, add_info_encoders, valid_mask):
+                        projection_ffn, timestamp_encoder, add_info_encoders, valid_mask, projection_before_summation):
     """
     LLM 미사용 시, 미리 tensor화된 item embedding과 timestamp, add_info를 결합하여
     2층 FFN projection으로 emb_dim 차원으로 매핑합니다.
@@ -259,9 +259,10 @@ def get_item_embeddings(item_ids, add_info, timestamps, item_embeddings_tensor,
     - timestamps: [B, S, I] tensor (float)
     - item_embeddings_tensor: [N+1, base_dim] tensor, 여기서 index 0은 패딩 전용 0 벡터
     - projection_ffn: ProjectionFFN 모듈 (입력: base_dim, 출력: emb_dim)
-    - timestamp_encoder: TimestampEncoder 모듈 (출력: base_dim)
-    - add_info_encoders: list of AddInfoEncoder 모듈 (각 출력: base_dim)
+    - timestamp_encoder: TimestampEncoder 모듈 (출력: base_dim 혹은 emb_dim)
+    - add_info_encoders: list of AddInfoEncoder 모듈 (각 출력: base_dim 혹은 emb_dim)
     - valid_mask: [B, S, I] tensor (1: valid, 0: padding)
+    - projection_before_summation: bool, projection_ffn을 합산 전에 적용할지 여부
     
     반환: [B, S, I, emb_dim] tensor (padding 위치는 0)
     """
@@ -280,8 +281,8 @@ def get_item_embeddings(item_ids, add_info, timestamps, item_embeddings_tensor,
 
     # --- 2. Timestamp 인코딩 (벡터화) ---
     ts_flat = timestamps.reshape(-1, 1)         # [B*S*I, 1]
-    ts_enc_flat = timestamp_encoder(ts_flat) # [B*S*I, base_dim]
-    ts_enc = ts_enc_flat.reshape(B, S, I, -1)     # [B, S, I, base_dim]
+    ts_enc_flat = timestamp_encoder(ts_flat) # [B*S*I, base_dim] or [B*S*I, emb_dim]
+    ts_enc = ts_enc_flat.reshape(B, S, I, -1)     # [B, S, I, base_dim] or [B, S, I, emb_dim]
 
     # --- 3. Add_info 인코딩 (리스트를 tensor로 변환) ---
     num_add_info = len(add_info_encoders)
@@ -297,22 +298,28 @@ def get_item_embeddings(item_ids, add_info, timestamps, item_embeddings_tensor,
                         raise ValueError(f"add_info[{b}][{s}][{i}]는 리스트여야 합니다.")
                     add_info_tensor[b, s, i] = torch.tensor(ai_vals, dtype=torch.float32, device=device)
 
-    add_enc_sum = torch.zeros(B, S, I, base_dim, device=device)
+    add_enc_sum = torch.zeros(B, S, I, ts_enc.shape[-1], device=device)
     for j, encoder in enumerate(add_info_encoders):
         ai_j = add_info_tensor[..., j].view(-1, 1)      # [B*S*I, 1]
-        ai_enc_flat = encoder(ai_j)                     # [B*S*I, base_dim]
-        ai_enc = ai_enc_flat.view(B, S, I, -1)            # [B, S, I, base_dim]
+        ai_enc_flat = encoder(ai_j)                     # [B*S*I, base_dim] or [B*S*I, emb_dim]
+        ai_enc = ai_enc_flat.view(B, S, I, -1)            # [B, S, I, base_dim] or [B, S, I, emb_dim]
         add_enc_sum = add_enc_sum + ai_enc
 
     # --- 4. 요소별 결합 ---
     # base_embs, ts_enc, add_enc_sum 모두 [B, S, I, base_dim]
-    combined = base_embs + 0.1 * ts_enc + 0.1 * add_enc_sum
-    combined = combined * valid_mask.unsqueeze(-1).float()  # padding 위치 0으로 처리
+    if projection_before_summation:
+        base_embs_flat = base_embs.view(-1, base_dim)
+        projected_flat = projection_ffn(base_embs_flat)  # [B*S*I, emb_dim]
+        projected = projected_flat.view(B, S, I, -1)      # [B, S, I, emb_dim]
+        projected = projected + 0.1 * ts_enc + 0.1 * add_enc_sum
+    else:
+        combined = base_embs + 0.1 * ts_enc + 0.1 * add_enc_sum
+        combined = combined * valid_mask.unsqueeze(-1).float()  # padding 위치 0으로 처리
 
-    # --- 5. Projection FFN 적용 ---
-    combined_flat = combined.view(-1, base_dim)     # [B*S*I, base_dim]
-    projected_flat = projection_ffn(combined_flat)    # [B*S*I, emb_dim]
-    projected = projected_flat.view(B, S, I, -1)       # [B, S, I, emb_dim]
+        # --- 5. Projection FFN 적용 ---
+        combined_flat = combined.view(-1, base_dim)     # [B*S*I, base_dim]
+        projected_flat = projection_ffn(combined_flat)    # [B*S*I, emb_dim]
+        projected = projected_flat.view(B, S, I, -1)       # [B, S, I, emb_dim]
     
     return projected
 
@@ -326,7 +333,8 @@ def get_embeddings(batch_dict, use_llm,
                    projection_ffn=None,
                    timestamp_encoder=None,
                    add_info_encoder=None,
-                   valid_mask=None):
+                   valid_mask=None,
+                   projection_before_summation=False):
     """
     batch_dict: collate_fn 결과 (dict)
       - use_llm=True: {'embedding_sentences': ..., 'interaction_mask': ...}
@@ -345,7 +353,8 @@ def get_embeddings(batch_dict, use_llm,
                                          projection_ffn,
                                          timestamp_encoder,
                                          add_info_encoder,
-                                         valid_mask)
+                                         valid_mask,
+                                         projection_before_summation)
     return emb_output
 
 
@@ -371,8 +380,8 @@ class TimeGapEmbedding(nn.Module):
             self.fc3 = nn.Linear(sinusoidal_dim, embedding_dim)
         if embedding_type == 'hybrid':
             # hybrid: FFN + Sinusoidal
-            self.fc1 = nn.Linear(sinusoidal_dim, hidden_dim)
-            self.fc2 = nn.Linear(hidden_dim, embedding_dim)
+            self.fc1 = nn.Linear(sinusoidal_dim, embedding_dim)
+           #self.fc2 = nn.Linear(hidden_dim, embedding_dim)
         if embedding_type == 'sinusoidal':
             # 만약 최종 차원이 sinusoidal_dim과 다르다면 간단한 선형 투사를 후처리로 추가할 수 있음
             if embedding_dim != sinusoidal_dim:
@@ -407,8 +416,9 @@ class TimeGapEmbedding(nn.Module):
             sin_enc = sinusoidal_encoding(x_exp, self.sinusoidal_dim, self.sinusoidal_max)  # [B, S, I, sinusoidal_dim]
             if torch.isnan(sin_enc).any():
                 print(f"[WARNING] NaN detected in sin_enc.")
-            ffn_out = F.relu(self.fc1(sin_enc))
-            ffn_out = self.fc2(ffn_out)  # [B, S, I, out_dim]
+            ffn_out = self.fc1(sin_enc)
+            #ffn_out = F.relu(self.fc1(sin_enc))
+            #ffn_out = self.fc2(ffn_out)  # [B, S, I, out_dim]
             return ffn_out
         else:
             raise ValueError("embedding_type must be 'ffn', 'sinusoidal', or 'hybrid'.")

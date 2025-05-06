@@ -3,14 +3,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class UserEmbeddingUpdater(nn.Module):
-    def __init__(self, embedding_dim=384):
+    def __init__(self, embedding_dim=128, update_initial_embedding=True, device='cpu'):
         super(UserEmbeddingUpdater, self).__init__()
-        
+        self.embedding_dim = embedding_dim
         # 모든 사용자가 동일하게 시작하는 initial embedding (학습 가능)
-        self.initial_embedding = nn.Parameter(torch.randn(embedding_dim))
-        
-        # 게이팅 메커니즘을 위한 선형 레이어
-        self.gating_layer = nn.Linear(embedding_dim * 2, embedding_dim)
+        self.initial_embedding =  torch.empty(embedding_dim, device=device)
+        nn.init.normal_(self.initial_embedding, std=0.02)
+        self.update_initial_embedding = update_initial_embedding
+        self.ln_gate = nn.LayerNorm(embedding_dim * 2)          # NEW
+        self.mlp_gate = nn.Sequential(                          # NEW
+            nn.Linear(embedding_dim * 2, embedding_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embedding_dim, embedding_dim)
+        )
+        nn.init.xavier_uniform_(self.mlp_gate[0].weight, gain=0.5)  # smaller init
+        nn.init.xavier_uniform_(self.mlp_gate[2].weight, gain=0.5)
+
+    def _gate(self, user, sess):
+        h = torch.cat([user, sess], dim=-1)         # [B,2D]
+        h = self.ln_gate(h)                         # stabilise scale
+        g = torch.sigmoid(self.mlp_gate(h))         # [B,D] with rich but bounded scale
+        return g
 
     def aggregate_attention(self, attention_output, interaction_mask):
         """
@@ -37,7 +50,7 @@ class UserEmbeddingUpdater(nn.Module):
 
         return session_emb
 
-    def forward(self, attention_output, interaction_mask, session_mask, prev_user_embedding=None):
+    def forward(self, prev_session_attn, prev_inter_mask, session_gap_emb, prev_user_emb=None):
         """
         이전의 user embedding을 받아 session 결과를 바탕으로 gating하여 업데이트
         
@@ -50,7 +63,33 @@ class UserEmbeddingUpdater(nn.Module):
         Returns:
         - user_embedding: [batch_size, embedding_dim] (업데이트된 사용자 embedding)
         """
-        batch_size, max_session, _, embedding_dim = attention_output.shape
+        if prev_user_emb is None:
+            if self.update_initial_embedding:
+                # 모든 사용자가 동일하게 시작하는 초기 embedding
+                user = self.initial_embedding.unsqueeze(0).expand(session_gap_emb.size(0), -1)
+            else:
+                user = self.initial_embedding.detach().unsqueeze(0).expand(session_gap_emb.size(0), -1)
+        else:
+            user = prev_user_emb
+
+        if prev_session_attn is not None:
+            # aggregate previous session embedding (exclude CLS)
+            sess_vec = prev_session_attn[:, 1:, :]   # [B,I,D]
+            mask    = prev_inter_mask[:, 1:].unsqueeze(-1)    # [B,I,1]
+            denom   = mask.sum(1).clamp(min=1)
+            sess_emb = (sess_vec * mask).sum(1) / denom        # [B,D]
+        else:
+            sess_emb = torch.zeros_like(user)
+        
+
+        # combine previous session info with current gap
+        combined = sess_emb + session_gap_emb                  # [B,D]
+        g = self._gate(user, combined)                        # [B,D]
+        user = g * user + (1 - g) * combined
+        return user
+        
+
+        """batch_size, max_session, _, embedding_dim = attention_output.shape
 
         # Aggregate session-level embedding (interaction 수 고려한 가중 평균)
         session_emb = self.aggregate_attention(attention_output, interaction_mask)  # [batch_size, max_session, embedding_dim]
@@ -73,6 +112,6 @@ class UserEmbeddingUpdater(nn.Module):
             updated_emb = gate * user_emb + (1 - gate) * current_session_emb
 
             # 세션이 없는 경우 (padding된 세션) 이전 embedding 유지
-            user_emb = updated_emb * sess_exist + user_emb * (1 - sess_exist)
+            user_emb = updated_emb * sess_exist + user_emb * (1 - sess_exist)"""
 
         return user_emb

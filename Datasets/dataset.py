@@ -38,7 +38,7 @@ class SeqRecDataset(Dataset):
                     add_info = None
                 else:               
                     sentence = None
-                delta_t = None if prev_timestamp is None else math.log(timestamp - prev_timestamp + 1e-7)
+                delta_t = math.log(timestamp + 1e-7) if prev_timestamp is None else math.log(timestamp - prev_timestamp + 1e-7)
                 prev_timestamp = timestamp
 
                 session_interactions.append({

@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .Part1_Embedding import sentence_embedder, get_embeddings, AddInfoEncoder, TimestampEncoder, ProjectionFFN, TimeGapEmbedding
-from .Part2_Session import MultiHeadSelfAttention, preprocess_inputs, create_ffn_model
+from .Part2_Session import MultiHeadSelfAttention, preprocess_inputs, create_ffn_model, EfficientMHA, MaskedLayerNorm
 from .Part3_UserEmbbeding import UserEmbeddingUpdater
 
 from time import time
@@ -87,8 +87,8 @@ def pad_features(tensor_list, pad_value=0.0):
 def select_target_features_flat(ffn_out, valid_mask, strategy):
     """
     Args:
-      ffn_out: [B, S, I, d] tensor (각 토큰의 FFN 출력)
-      valid_mask: [B, S, I] Boolean tensor (True: valid, False: invalid)
+      ffn_out: [B, S, I+1, d] tensor (각 토큰의 FFN 출력)
+      valid_mask: [B, S, I+1] Boolean tensor (True: valid, False: invalid)
       strategy: 선택 전략 문자열. 아래 7가지 중 하나:
           - 'EachSession_LastInter'
           - 'Global_LastInter'
@@ -105,137 +105,90 @@ def select_target_features_flat(ffn_out, valid_mask, strategy):
     """
     B, S, I, d = ffn_out.shape
     # 결과를 저장할 리스트들 (각 배치 sample별)
-    all_selected = []
-    all_loss_mask = []
-    all_session_ids = []
+    selected, valid_mask_list, sess_ids_list = [], [], []
     
     for b in range(B):
-        selected = []      # 선택된 feature (tensor shape: [*, d])
-        valid_mask_list = []  # 각 선택된 feature에 대해 True (나중에 모두 True, padding은 False)
-        sess_ids_list = []    # 각 선택 토큰의 session id
-        
-        if strategy in ['Global_LastInter', 'AllInter', 'AllInter_ExceptFirst']:
-            # 전체 flatten 처리: ignore 세션 구분
-            flat_feat = ffn_out[b].reshape(-1, d)          # [S*I, d]
-            flat_valid = valid_mask[b].reshape(-1)           # [S*I]
-            valid_idxs = (flat_valid == True).nonzero(as_tuple=False).squeeze(-1)
-            if valid_idxs.dim() == 0:
-                valid_idxs = valid_idxs.unsqueeze(0)
-            if strategy == 'Global_LastInter':
-                # 전체에서 마지막 valid token만 선택
-                if valid_idxs.numel() > 0:
-                    valid_idxs = valid_idxs[-1:].clone()  # keep as 1 element
-                else:
-                    valid_idxs = valid_idxs  # empty
-            elif strategy == 'AllInter_ExceptFirst':
-                # flatten 순서대로 첫 번째 valid token 제외
-                if valid_idxs.numel() > 0:
-                    valid_idxs = valid_idxs[1:]
-            elif strategy == 'AllInter':
-                # 모든 valid token 선택 → 그대로 valid_idxs
-                pass
-            # 선택된 인덱스에 해당하는 feature와 session id 계산
-            for idx in valid_idxs:
-                selected.append(flat_feat[idx])
-                valid_mask_list.append(True)
-                # 세션 id: flatten index // I (정수 나눗셈)
-                sess_ids_list.append(int(idx // I))
-                
-        else:
-            # 세션별 처리: 각 세션마다 따로 valid token을 선택
-            # (각 세션의 처리 결과들을 순서대로 concatenate함)
-            for s in range(S):
-                session_feat = ffn_out[b, s, :, :]       # [I, d]
-                session_valid = valid_mask[b, s, :]        # [I]
-                valid_idxs = (session_valid == True).nonzero(as_tuple=False).squeeze(-1)
-                if valid_idxs.dim() == 0:
-                    valid_idxs = valid_idxs.unsqueeze(0)
-                if strategy == 'EachSession_LastInter':
-                    if valid_idxs.numel() > 0:
-                        # 마지막 valid token만 선택
-                        sel_idx = valid_idxs[-1]
-                        selected.append(session_feat[sel_idx])
-                        valid_mask_list.append(True)
-                        sess_ids_list.append(s)
-                elif strategy == 'EachSession_First_and_Last_Inter':
-                    if valid_idxs.numel() > 0:
-                        # 첫 번째와 마지막 토큰 선택
-                        first_idx = valid_idxs[0]
-                        selected.append(session_feat[first_idx])
-                        valid_mask_list.append(True)
-                        sess_ids_list.append(s)
-                        if valid_idxs.numel() > 1:
-                            last_idx = valid_idxs[-1]
-                            selected.append(session_feat[last_idx])
-                            valid_mask_list.append(True)
-                            sess_ids_list.append(s)
-                elif strategy == 'EachSession_Except_First':
-                    if valid_idxs.numel() > 0:
-                        # 첫 번째 토큰 제외한 나머지 선택 (모든 valid token이 하나만 있으면 그 토큰을 선택)
-                        if valid_idxs.numel() > 1:
-                            for idx in valid_idxs[1:]:
-                                selected.append(session_feat[idx])
-                                valid_mask_list.append(True)
-                                sess_ids_list.append(s)
-                        else:
-                            selected.append(session_feat[valid_idxs[0]])
-                            valid_mask_list.append(True)
-                            sess_ids_list.append(s)
-                elif strategy == 'LastSession_AllInter':
-                    # 이 전략은 전체 세션 중 마지막 valid session에서만 선택
-                    pass  # 아래에서 처리한 후 loop를 빠져나가서 한 번만 선택하도록 함
-                else:
-                    # 기본: 각 세션에서 마지막 valid token 선택 (default)
-                    if valid_idxs.numel() > 0:
-                        sel_idx = valid_idxs[-1]
-                        selected.append(session_feat[sel_idx])
-                        valid_mask_list.append(True)
-                        sess_ids_list.append(s)
-            # 만약 strategy가 'LastSession_AllInter'이면,
-            if strategy == 'LastSession_AllInter':
-                # 첫째, 각 세션이 valid했는지 판단하여 마지막 valid session index 구하기
-                valid_sessions = []
-                for s in range(S):
-                    if valid_mask[b, s, :].any():
-                        valid_sessions.append(s)
-                if valid_sessions:
-                    last_s = valid_sessions[-1]
-                    session_feat = ffn_out[b, last_s, :, :]
-                    session_valid = valid_mask[b, last_s, :]
-                    valid_idxs = (session_valid == True).nonzero(as_tuple=False).squeeze(-1)
-                    if valid_idxs.dim() == 0:
-                        valid_idxs = valid_idxs.unsqueeze(0)
-                    # 선택: 모든 valid token in that session
-                    selected = []  # overwrite previous selection for this sample
-                    valid_mask_list = []
-                    sess_ids_list = []
-                    for idx in valid_idxs:
-                        selected.append(session_feat[idx])
-                        valid_mask_list.append(True)
-                        sess_ids_list.append(last_s)
-                else:
-                    selected = []
-                    valid_mask_list = []
-                    sess_ids_list = []
-        
-        # selected: list of tensors with shape [d] for sample b
-        if len(selected) == 0:
-            selected_tensor = torch.empty(0, d, device=ffn_out.device)
-        else:
-            selected_tensor = torch.stack(selected, dim=0)  # [L_b, d]
-        all_selected.append(selected_tensor)
-        # loss mask: boolean vector of length L_b (all True for selected tokens)
-        all_loss_mask.append(torch.tensor(valid_mask_list, dtype=torch.bool, device=ffn_out.device))
-        # session ids: tensor of shape [L_b]
-        all_session_ids.append(torch.tensor(sess_ids_list, dtype=torch.long, device=ffn_out.device))
+        sel_b, mask_b, sess_b = [], [], []
+
+        # 세션별 valid 인덱스 리스트( CLS 포함 ), 마지막 interaction 제거
+        sess_candidates = []        # 각 세션의 [tensor(valid_idxs_제거후)]
+        for s in range(S):
+            v_idx = (valid_mask[b, s] == True).nonzero(as_tuple=False).squeeze(-1)
+            if v_idx.numel() > 1:           # CLS + ≥1 interaction
+                sess_candidates.append((s, v_idx[:-1]))   # 마지막-1까지
+            elif v_idx.numel() == 1:
+                # CLS만 있으면 학습 타깃 없음 -- skip
+                continue
+
+        # ---------- strategy 처리 ----------
+        if strategy == 'AllInter':
+            # 세션 경계 무시, 전부 concat
+            for s, idxs in sess_candidates:
+                for idx in idxs:
+                    sel_b.append(ffn_out[b, s, idx])
+                    mask_b.append(True)
+                    sess_b.append(s)
+
+        elif strategy == 'AllInter_ExceptFirst':
+            flat = [(s, idx) for s, idxs in sess_candidates for idx in idxs]
+            if len(flat) > 1:
+                flat = flat[1:]            # 첫 CLS 제외
+            for s, idx in flat:
+                sel_b.append(ffn_out[b, s, idx])
+                mask_b.append(True)
+                sess_b.append(s)
+
+        elif strategy == 'Global_LastInter':
+            flat = [(s, idx) for s, idxs in sess_candidates for idx in idxs]
+            if flat:
+                s, idx = flat[-1]          # 전 세션 concat 후 마지막
+                sel_b.append(ffn_out[b, s, idx])
+                mask_b.append(True)
+                sess_b.append(s)
+
+        elif strategy == 'EachSession_LastInter':
+            for s, idxs in sess_candidates:
+                idx = idxs[-1]             # 세션 내 마지막(= 원래 뒤-두-번째)
+                sel_b.append(ffn_out[b, s, idx])
+                mask_b.append(True)
+                sess_b.append(s)
+
+        elif strategy == 'EachSession_First_and_Last_Inter':
+            for s, idxs in sess_candidates:
+                # 첫 interaction (CLS 제외) == idxs[1]  /  CLS 도 쓰려면 idxs[0]
+                first = idxs[0]
+                last  = idxs[-1] if idxs.numel() > 1 else None
+                sel_b.append(ffn_out[b, s, first]);  mask_b.append(True); sess_b.append(s)
+                if last is not None and last != first:
+                    sel_b.append(ffn_out[b, s, last]); mask_b.append(True); sess_b.append(s)
+
+        elif strategy == 'EachSession_Except_First':
+            for s, idxs in sess_candidates:
+                if idxs.numel() > 1:
+                    for idx in idxs[1:]:   # 첫 CLS 제외, 나머지 모두
+                        sel_b.append(ffn_out[b, s, idx])
+                        mask_b.append(True)
+                        sess_b.append(s)
+
+        else:   # 디폴트: EachSession_LastInter
+            for s, idxs in sess_candidates:
+                idx = idxs[-1]
+                sel_b.append(ffn_out[b, s, idx])
+                mask_b.append(True)
+                sess_b.append(s)
+
+        # --- 배치 b 결과 누적 ---
+        selected.append(torch.stack(sel_b) if sel_b else torch.empty((0,d),device=ffn_out.device))
+        valid_mask_list.append(torch.tensor(mask_b, dtype=torch.bool, device=ffn_out.device))
+        sess_ids_list.append(torch.tensor(sess_b, dtype=torch.long, device=ffn_out.device))
     
     # 배치 내 최대 길이(L_max)
-    L_max = max(selected.shape[0] for selected in all_selected) if all_selected else 0
+    L_max = max(select.shape[0] for select in selected) if selected else 0
     
     padded_features = []
     padded_loss_mask = []
     padded_session_ids = []
-    for feat, mask, sess_ids in zip(all_selected, all_loss_mask, all_session_ids):
+    for feat, mask, sess_ids in zip(selected, valid_mask_list, sess_ids_list):
         L = feat.shape[0]
         if L < L_max:
             pad_feat = torch.zeros(L_max - L, d, device=ffn_out.device)
@@ -267,7 +220,8 @@ class SeqRecModel(nn.Module):
                  dropout=0.2,
                  item_embedding_tensor = None,
                  hf_model_path='sentence-transformers/all-MiniLM-L6-v2',
-                 device='cpu'):
+                 device='cpu',
+                 projection_before_summation = False):
         super(SeqRecModel, self).__init__()
         
         self.strategy = strategy
@@ -283,25 +237,42 @@ class SeqRecModel(nn.Module):
         self.use_lora = lora['use']
         self.lora_r = lora['r']
         self.lora_alpha = lora['alpha']
+        self.projection_before_summation = projection_before_summation
 
         if self.use_llm: 
             self.tokenizer, self.sentence_model = sentence_embedder(hf_model_path)
             self.projection_ffn = None
+            if self.use_lora:
+                from models.model import apply_lora  # assume apply_lora is defined in model.py
+                apply_lora(self.sentence_model, r=self.lora_r, alpha=self.lora_alpha)
+        elif self.projection_before_summation:
+            self.add_info_ffn = nn.ModuleList([AddInfoEncoder(embed_dim) for _ in range(num_add_info)])
+            self.projection_ffn = ProjectionFFN(384, ffn_hidden_dim, embed_dim, device)
+            self.timestamp_encoder = TimestampEncoder(embed_dim)
         else: 
             self.add_info_ffn = nn.ModuleList([AddInfoEncoder(384) for _ in range(num_add_info)])
             self.projection_ffn = ProjectionFFN(384, ffn_hidden_dim, embed_dim, device)
             self.timestamp_encoder = TimestampEncoder(384)
+        
 
         self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
-        if self.use_lora:
-            from models.model import apply_lora  # assume apply_lora is defined in model.py
-            apply_lora(self.sentence_model, r=self.lora_r, alpha=self.lora_alpha)
+        
         
         self.time_gap_embed = TimeGapEmbedding(embedding_dim=embed_dim, hidden_dim=time_gap_hidden_dim, embedding_type='hybrid', sinusoidal_dim=512)
-        self.attention = MultiHeadSelfAttention(embedding_dim=embed_dim, num_heads=num_attention_heads, dropout=dropout)
+        #self.attention = MultiHeadSelfAttention(embedding_dim=embed_dim, num_heads=num_attention_heads, dropout=dropout)
+        self.ln = MaskedLayerNorm(embed_dim)
+        self.attention = EfficientMHA(d_model=embed_dim, n_heads=num_attention_heads, dropout=dropout)
         self.ffn = create_ffn_model(input_dim=embed_dim, hidden_dim=ffn_hidden_dim, output_dim=embed_dim)
-        self.user_emb_updater = UserEmbeddingUpdater(embedding_dim=embed_dim)
+        self.user_emb_updater = UserEmbeddingUpdater(embedding_dim=embed_dim, update_initial_embedding= self.update_initial_embedding, device=device)
 
+    @staticmethod
+    def build_attn_mask(pad: torch.Tensor) -> torch.Tensor:
+        # pad: [B,L] (1=keep,0=pad) → mask [B,L,L], True=keep
+        B, L = pad.shape
+        causal = torch.tril(torch.ones(L, L, device=pad.device)).bool()
+        mask = causal & pad.unsqueeze(1).bool() & pad.unsqueeze(2).bool()
+        return mask
+    
     def forward(self, batch, prev_user_embedding=None, chunk=False):
         """
         batch: {
@@ -339,16 +310,54 @@ class SeqRecModel(nn.Module):
                                 projection_ffn=self.projection_ffn,
                                 add_info_encoder=self.add_info_ffn,
                                 timestamp_encoder=self.timestamp_encoder,
-                                valid_mask=batch['interaction_mask'])
+                                valid_mask=batch['interaction_mask'],
+                                projection_before_summation = self.projection_before_summation)
             
-        
-        time_gap_emb = self.time_gap_embed(batch['delta_ts'])  # [B, S, I, d]
+        delta = batch['delta_ts']  # [B, S, I]
+        time_gap_emb = self.time_gap_embed(delta)  # [B, S, I, d]
         if not self.update_time_gap:
             time_gap_emb = time_gap_emb.detach()
         combined_emb = seq_emb + time_gap_emb  # [B, S, I, d]
         
         # --- User Embedding 초기화 ---
         B, S, I, d = combined_emb.shape
+        L = I + 1
+        
+        cls_token = self.cls_token.view(1,1,1,d).expand(B,S,1,d)
+        sess_in = torch.cat([cls_token, combined_emb], dim=2) # [B, S, L, d]
+
+        # 3) mask (CLS always 1)
+        inter_mask = batch['interaction_mask']                 # [B,S,I]
+        mask = torch.cat([torch.ones(B, S, 1, device=seq_emb.device), inter_mask], dim=2)        # [B,S,L]
+
+        # 4) flatten S into batch
+        flat_in   = sess_in.reshape(B*S, L, d)
+        flat_mask = mask.reshape(B*S, L)
+        attn_mask = self.build_attn_mask(flat_mask)            # [B*S,L,L]
+
+        # 5) Attention + FFN
+        flat_in = self.ln(flat_in, flat_mask)
+        attn_out = self.attention(flat_in, attn_mask).reshape(B, S, L, d)    # [B*S,L,D]
+
+        user = prev_user_embedding
+        ffn_in_all = []
+        for s in range(S):
+            gap_cur = time_gap_emb[:, s, 0, :]                      # first Δt embed of current session [B,D]
+            prev_attn = None if s==0 else attn_out[:, s-1]
+            prev_mask = None if s==0 else mask[:, s-1]
+            user = self.user_emb_updater(prev_attn, prev_mask, gap_cur, user)  # update before processing session s
+
+            # prepare FFN input for session s
+            ffn_in = preprocess_inputs(attn_out[:, s, :-1], time_gap_emb[:, s], user, valid_mask=mask[:, s, :-1])
+            ffn_in_all.append(ffn_in)  # [B, 1, I, d]
+        ffn_in = torch.stack(ffn_in_all, 1)  # [B, S, I, d]
+        ffn_out = self.ffn(ffn_in, mask[:, :, :-1]) # [B, S, I, d]
+        if chunk:
+            return ffn_out, mask, user
+        sel = select_target_features_flat(ffn_out, mask, self.strategy)
+        return sel, user
+
+"""
         if prev_user_embedding is not None:
             user_emb_current = prev_user_embedding
         else:
@@ -374,16 +383,16 @@ class SeqRecModel(nn.Module):
             sess_input = session_input[:, s, :, :]   # [B, I+1, d]
             sess_mask = session_mask_extended[:, s, :] # [B, I+1]
             attn_out = self.attention(sess_input, sess_mask)  # [B, I+1, d]
-            ffn_input = attn_out[:, 1:, :]  # 실제 예측 대상, [B, I, d]
+            ffn_input = attn_out  # 실제 예측 대상, [B, I+1, d]
             # 시간 gap 처리: [CLS] 자리에는 0 벡터
             zero_time = torch.zeros(B, 1, attn_out.size(-1), device=attn_out.device)
             sess_time_gap = torch.cat([zero_time, time_gap_emb[:, s, :, :]], dim=1)  # [B, I+1, d]
-            ffn_time_gap = sess_time_gap[:, 1:, :]  # [B, I, d]
+            ffn_time_gap = sess_time_gap  # [B, I+1, d]
             # preprocess_inputs 함수를 이용하여 FFN 입력 준비 (user embedding 더함)
             # 여기서는 user embedding 업데이트도 진행 (원래 코드처럼)
-            ffn_in = preprocess_inputs(ffn_input, ffn_time_gap, user_emb_current.unsqueeze(1), valid_mask=sess_mask[:, 1:])
-            ffn_out = self.ffn(ffn_in)  # [B, I, d]
-            ffn_out_list.append(ffn_out.unsqueeze(1))  # [B, 1, I, d]
+            ffn_in = preprocess_inputs(ffn_input, ffn_time_gap, user_emb_current.unsqueeze(1), valid_mask=sess_mask)
+            ffn_out = self.ffn(ffn_in)  # [B, I+1, d]
+            ffn_out_list.append(ffn_out.unsqueeze(1))  # [B, 1, I+1, d]
             # Update user embedding per session (기존 코드 그대로)
             prev_user_embedding = self.user_emb_updater(
                 attn_out.unsqueeze(1),           # [B, 1, I+1, d]
@@ -391,10 +400,10 @@ class SeqRecModel(nn.Module):
                 batch['session_mask'][:, s].unsqueeze(-1),  # [B, 1]
                 prev_user_embedding=user_emb_current
             )
-        # Stack FFN 출력: [B, S, I, d]
+        # Stack FFN 출력: [B, S, I+1, d]
         ffn_out_all = torch.cat(ffn_out_list, dim=1)
-        # valid mask for FFN output는 원래의 interaction_mask: [B, S, I]
-        valid_mask_all = batch['interaction_mask']
+        # valid mask for FFN output는 원래의 interaction_mask: [B, S, I+1]
+        valid_mask_all = session_mask_extended# batch['interaction_mask']
         
         if chunk:
             return ffn_out_all, valid_mask_all, prev_user_embedding
@@ -403,4 +412,4 @@ class SeqRecModel(nn.Module):
             selected_target_features = select_target_features_flat(ffn_out_all, valid_mask_all, self.strategy)
             # selected_target_features: [B, L, d], loss_mask: [B, L], session_ids: [B, L]
             
-            return selected_target_features, prev_user_embedding
+            return selected_target_features, prev_user_embedding"""

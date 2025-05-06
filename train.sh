@@ -10,44 +10,57 @@ fi
 
 echo "실험 시작..."
 
+:<<'END'
+echo "실험 1 실행: 기본 (Globo, global_candidate, train_strategy EachSession_Except_First)"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag  --train_batch_th 750000
 
-# 실험 2: 기본 데이터셋(예: Globo), candidate_size 64, use_amp, accumulation_steps 4, device cuda:1
-#echo "실험 1 실행: Globo에서 train_strategy EachSession_Except_First"
-#python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_Except_First --train_batch_th 100000
+echo "실험 2 실행: Learning rate 0.005로 증가가"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --train_batch_th 750000 --lr 0.005
 
-echo "실험 2 실행: Globo에서 train_strategy EachSession_First_and_Last_Inter"
-python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_First_and_Last_Inter  --train_batch_th 1000000
+echo "실험 3 실행: Learning rate 0.01로 증가가"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --train_batch_th 750000 --lr 0.01
 
-#echo "실험 3 실행: Globo에서 test때 global_candidate 미사용"
-#python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --test_global_candidate False  --train_batch_th 750000
+echo "실험 4 실행: train_strategy EachSession_Except_First"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_Except_First --train_batch_th 100000
 
-echo "실험 4 실행: 기본 (Globo, global_candidate, train_strategy EachSession_Except_First)"
-python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag  --train_batch_th 750000
+echo "실험 5 실행: train_strategy EachSession_First_and_Last_Inter"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_First_and_Last_Inter --train_batch_th 300000
 
-#echo "실험 5 실행: Globo에서 train_strategy AllInter_ExceptFirst"
-#python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --train_strategy AllInter_ExceptFirst  --train_batch_th 150000
+echo "실험 6 실행: train_strategy AllInter_ExceptFirst"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --train_strategy AllInter_ExceptFirst --train_batch_th 100000
 
-echo "실험 6 실행: Globo learning rate 0.01"
-python train.py --device $1 --test_strategy AllInter_ExceptFirst --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag  --train_batch_th 750000 --lr 0.01
+echo "실험 7 실행: accumulateion_steps 4"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 64 --accumulation_steps 1 $wandb_flag --train_batch_th 750000
 
 
-# 실험 1: LFM-BeyMS 데이터셋, candidate_size 64, use_amp, accumulation_steps 4, device cuda:1
-#echo "실험 2 실행: LFM-BeyMS 데이터셋 lr 2e-4, test_strategy AllInter_ExceptFirst"
-#python train.py --device $1 --candidate_size 64 --dataset_name LFM-BeyMS --use_amp --accumulation_steps 16 $wandb_flag --test_strategy AllInter_ExceptFirst
+echo "실험 3 실행: EachSession_Except_First Candidate 100 accumulation_steps 4 lr 4e-3"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 100 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_Except_First --train_batch_th 200000 --lr 1e-3
 
-# 실험 3: Retail rocket 데이터셋, candidate_size 64, use_amp, accumulation_steps 4, device cuda:1
-#echo "실험 3 실행: Retail rocket 데이터셋"
-#python train.py --device $1 --candidate_size 64 --dataset_name Retail_Rocket --use_amp --accumulation_steps 4 $wandb_flag --test_strategy AllInter_ExceptFirst
+echo "실험 4 실행: EachSession_Except_First Candidate 100 batch_th 30000"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 100 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_Except_First --train_batch_th 30000 --weight_decay 1e-3 --lr 1e-4
 
-# 실험 4: 기본 데이터셋(예: Globo), candidate_size 64, use_amp, accumulation_steps 4, device cuda:1 모든거거
-#echo "실험 4 실행: 기본 데이터셋 (Globo)"
-#python train.py --device $1 --candidate_size 64 --train_strategy AllInter_ExceptFirst --use_amp --accumulation_steps 4 $wandb_flag --test_strategy AllInter_ExceptFirst
+echo "실험 5 실행: EachSession_Except_First Candidate 100 lr 5e-4"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 100 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_Except_First --train_batch_th 200000 --lr 2e-3
 
-# 실험 5: LFM-BeyMS 데이터셋, candidate_size 64, use_amp, accumulation_steps 4, device cuda:1
-#echo "실험 5 실행: LFM-BeyMS 데이터셋"
-#python train.py --device $1 --candidate_size 64 --train_strategy AllInter_ExceptFirst --dataset_name LFM-BeyMS --use_amp --accumulation_steps 16 $wandb_flag --test_strategy AllInter_ExceptFirst
 
-# 실험 6: Retail rocket 데이터셋, candidate_size 64, use_amp, accumulation_steps 4, device cuda:1
-#echo "실험 6 실행: Retail rocket 데이터셋"
-#python train.py --device $1 --candidate_size 64 --train_strategy AllInter_ExceptFirst --dataset_name Retail_Rocket --use_amp --accumulation_steps 4 $wandb_flag --test_strategy AllInter_ExceptFirst
+echo "실험 1 실행: EachSession_Except_First Candidate 100 lr 1e-4"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 100 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_Except_First --train_batch_th 200000 --lr 1e-4
+
+echo "실험 2 실행: EachSession_Except_First Candidate 100 lr 5e-5"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 100 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_Except_First --train_batch_th 200000 --lr 5e-5
+END
+echo "실험 1 실행: EachSession_Except_First Candidate 100 lr 1e-3"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 100 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_Except_First --train_batch_th 10000 --weight_decay 1e-3 --lr 1e-3
+
+echo "실험 2 실행: EachSession_Except_First Candidate 100 lr 5e-4"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 100 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_Except_First --train_batch_th 10000 --weight_decay 1e-3 --lr 2e-3
+
+echo "실험 3 실행: EachSession_Except_First Candidate 100 lr 1e-5"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 100 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_Except_First --train_batch_th 30000 --lr 5e-4
+
+echo "실험 4 실행: EachSession_Except_First Candidate 100 wd 1e-3"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 100 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_Except_First --train_batch_th 30000 --weight_decay 1e-3 --lr 1e-3
+
+echo "실험 5 실행: EachSession_Except_First Candidate 100 lr 1e-4"
+python train.py --device $1 --test_strategy EachSession_LastInter --use_amp --candidate_size 100 --accumulation_steps 1 $wandb_flag --train_strategy EachSession_Except_First --train_batch_th 10000 --weight_decay 1e-3 --lr 1e-3
 echo "모든 실험 완료!"
